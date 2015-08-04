@@ -18,8 +18,13 @@
 
 #include <tickit.h>
 
-enum irc_command {
+/* Forward declarations of command handlers */
+static void command_join(char *);
+static void command_raw(char *);
+
+enum irc_reply_type {
     IRC_ERROR,
+    IRC_JOIN,
     IRC_MODE,
     IRC_MOTD,
     IRC_MOTD_END,
@@ -32,12 +37,13 @@ enum irc_command {
     IRC_PART,
     IRC_PING,
     IRC_PRIVMSG,
+    IRC_QUIT,
     IRC_UNKNOWN_COMMAND,
     IRC_WELCOME
 };
 
-struct irc_message {
-    enum irc_command command;
+struct irc_reply {
+    enum irc_reply_type type;
     struct {
         enum { IRC_PREFIX_SERVER, IRC_PREFIX_USER } type;
         union {
@@ -54,30 +60,57 @@ struct irc_message {
     char **paramv;
 };
 
+struct nick_node {
+    char *nick;
+    struct nick_node *next;
+};
+
+struct nick_list {
+    size_t count;
+    struct nick_node *head;
+};
+
+struct room {
+    enum { ROOM_PRIVATE, ROOM_CHANNEL } type;
+    char *target;
+    struct nick_list nicks;
+};
+
 struct message {
     time_t timestamp;
     char *channel;
     char *text;
 };
 
-struct { char const *string; enum irc_command command; } irc_command_table[] = {
-    { "372", IRC_MOTD },
-    { "ERROR", IRC_ERROR },
-    { "NOTICE", IRC_NOTICE },
-    { "PART", IRC_PART },
-    { "PRIVMSG", IRC_PRIVMSG },
-    { "375", IRC_MOTD_START },
-    { "376", IRC_MOTD_END },
-    { "PING", IRC_PING },
-    { "461", IRC_NEED_MORE_PARAMS },
-    { "421", IRC_UNKNOWN_COMMAND },
-    { "353", IRC_NAMES_REPLY },
-    { "366", IRC_NAMES_END },
-    { "001", IRC_WELCOME },
-    { "MODE", IRC_MODE }
+typedef void (*command_function)(char *);
+
+struct { char const *name; command_function function; } command_table[] = {
+    { "join", command_join },
+    { "raw",  command_raw }
 };
 
-static size_t const irc_commands = sizeof irc_command_table / sizeof irc_command_table[0];
+static size_t const command_count = sizeof command_table / sizeof command_table[0];
+
+struct { char const *string; enum irc_reply_type type; } irc_reply_table[] = {
+    { "372",     IRC_MOTD },
+    { "ERROR",   IRC_ERROR },
+    { "NOTICE",  IRC_NOTICE },
+    { "PART",    IRC_PART },
+    { "PRIVMSG", IRC_PRIVMSG },
+    { "375",     IRC_MOTD_START },
+    { "376",     IRC_MOTD_END },
+    { "PING",    IRC_PING },
+    { "461",     IRC_NEED_MORE_PARAMS },
+    { "421",     IRC_UNKNOWN_COMMAND },
+    { "353",     IRC_NAMES_REPLY },
+    { "366",     IRC_NAMES_END },
+    { "001",     IRC_WELCOME },
+    { "MODE",    IRC_MODE },
+    { "QUIT",    IRC_QUIT },
+    { "JOIN",    IRC_JOIN }
+};
+
+static size_t const irc_replies = sizeof irc_reply_table / sizeof irc_reply_table[0];
 
 static int connection;
 
@@ -98,6 +131,12 @@ static struct message *messages;
 static size_t message_count;
 static size_t message_alloc;
 
+static struct room *room;
+static struct room *rooms;
+static size_t room_count;
+static size_t room_alloc;
+
+static atomic_bool should_render;
 static atomic_bool should_pong;
 
 static FILE *log_file;
@@ -120,6 +159,15 @@ noreturn static void fatal(char const *fmt, ...)
     fputc('\n', stderr);
     va_end(ap);
     exit(EXIT_FAILURE);
+}
+
+static void notify(char const *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    va_end(ap);
+
+    return;
 }
 
 static char *duplicate(char const *s)
@@ -157,65 +205,75 @@ static size_t fit_in_columns(char const *s, size_t n)
             idx -= 1;
 
         return idx;
-    }
+}
 
-static void irc_message_record(struct irc_message const *message)
+static void unknown_command(char const *command)
+{
+    return;
+}
+
+static void ambiguous_command(char const *command)
+{
+    return;
+}
+
+static void irc_message_record(struct irc_reply const *reply)
 {
     record("===========================\n");
 
     bool implemented = false;
-    for (size_t i = 0; i < irc_commands; ++i) {
-        if (message->command == irc_command_table[i].command) {
+    for (size_t i = 0; i < irc_replies; ++i) {
+        if (reply->type == irc_reply_table[i].type) {
             implemented = true;
-            record("Command: %s\n", irc_command_table[i].string);
+            record("Reply type: %s\n", irc_reply_table[i].string);
             break;
         }
     }
 
     if (!implemented)
-        record("Command: UNIMPLEMENTED\n");
+        record("Reply type: UNRECOGNIZED\n");
 
-    if (message->has_prefix) {
-        if (message->prefix.type == IRC_PREFIX_SERVER) {
-            record("Server name: %s\n", message->prefix.server);
+    if (reply->has_prefix) {
+        if (reply->prefix.type == IRC_PREFIX_SERVER) {
+            record("Server name: %s\n", reply->prefix.server);
         } else {
-            record("Nick: %s\n", message->prefix.nick);
-            if (message->prefix.host)
-                record("Host: %s\n", message->prefix.host);
+            record("Nick: %s\n", reply->prefix.nick);
+            if (reply->prefix.host)
+                record("Host: %s\n", reply->prefix.host);
             else
                 record("Host: (null)\n");
-            if (message->prefix.user)
-                record("User: %s\n", message->prefix.user);
+            if (reply->prefix.user)
+                record("User: %s\n", reply->prefix.user);
             else
                 record("User: (null)\n");
         }
     }
 
-    record("Number of paramters: %zu\n", message->paramc);
+    record("Number of paramters: %zu\n", reply->paramc);
     record("Parameters:\n");
-    for (size_t i = 0; i < message->paramc; ++i)
-        record("\t%zu. %s\n", i + 1, message->paramv[i]);
+    for (size_t i = 0; i < reply->paramc; ++i)
+        record("\t%zu. %s\n", i + 1, reply->paramv[i]);
 
     record("===========================\n");
 }
 
-static struct irc_message irc_message_parse(char *message)
+static struct irc_reply irc_reply_parse(char *text)
 {
     static char first[256], second[256], third[256];
     static char separator[4];
-    struct irc_message result;
+    struct irc_reply reply;
 
-    result.command = IRC_NOT_IMPLEMENTED;
-    result.has_prefix = false;
+    reply.type = IRC_NOT_IMPLEMENTED;
+    reply.has_prefix = false;
 
-    if (*message == ':') {
+    if (*text == ':') {
 
-        message += 1;
+        text += 1;
 
-        result.has_prefix = true;
+        reply.has_prefix = true;
 
         int matched = sscanf(
-                message,
+                text,
                 "%255[^ @!]%1[^ ]%255[^ @]%c%255[^ ]",
                 first,
                 separator,
@@ -225,53 +283,53 @@ static struct irc_message irc_message_parse(char *message)
         );
 
         if (matched == 0)
-            fatal("Received an IRC message with an invalid format: `%s`", message);
+            fatal("Received an IRC message with an invalid format: `%s`", text);
 
         size_t consumed;
 
         if (matched == 1) {
             consumed = strlen(first);
             if (strchr(first, '.')) {
-                result.prefix.type = IRC_PREFIX_SERVER;
-                result.prefix.server = duplicate(first);
+                reply.prefix.type = IRC_PREFIX_SERVER;
+                reply.prefix.server = duplicate(first);
             } else {
-                result.prefix.type = IRC_PREFIX_USER;
-                result.prefix.nick = duplicate(first);
-                result.prefix.user = NULL;
-                result.prefix.host = NULL;
+                reply.prefix.type = IRC_PREFIX_USER;
+                reply.prefix.nick = duplicate(first);
+                reply.prefix.user = NULL;
+                reply.prefix.host = NULL;
             }
         } else {
-            result.prefix.type = IRC_PREFIX_USER;
-            result.prefix.nick = duplicate(first);
+            reply.prefix.type = IRC_PREFIX_USER;
+            reply.prefix.nick = duplicate(first);
             if (separator[0] == '!') {
                 consumed = strlen(first) + strlen(second) + strlen(third) + 2;
-                result.prefix.user = duplicate(second);
-                result.prefix.host = duplicate(third);
+                reply.prefix.user = duplicate(second);
+                reply.prefix.host = duplicate(third);
             } else {
                 consumed = strlen(first) + strlen(second) + 1;
-                result.prefix.host = duplicate(second);
-                result.prefix.user = NULL;
+                reply.prefix.host = duplicate(second);
+                reply.prefix.user = NULL;
             }
         }
 
-        message += consumed;
+        text += consumed;
 
-        if (*message != ' ')
-            fatal("Error parsing IRC message. Expecting ' ' but found: `%c`", *message);
+        if (*text != ' ')
+            fatal("Error parsing IRC message. Expecting ' ' but found: `%c`", *text);
     }
     
     /* We re-use the `first` buffer to parse the command */
     int chars;
-    int matched = sscanf(message, "%255s%n", first, &chars);
+    int matched = sscanf(text, "%255s%n", first, &chars);
 
     if (!matched)
-        fatal("No command in IRC message: `%s`", message);
+        fatal("No command in IRC message: `%s`", text);
 
-    message += chars;
+    text += chars;
 
-    for (size_t i = 0; i < irc_commands; ++i) {
-        if (!strcmp(irc_command_table[i].string, first)) {
-            result.command = irc_command_table[i].command;
+    for (size_t i = 0; i < irc_replies; ++i) {
+        if (!strcmp(irc_reply_table[i].string, first)) {
+            reply.type = irc_reply_table[i].type;
             break;
         }
     }
@@ -279,44 +337,44 @@ static struct irc_message irc_message_parse(char *message)
     /* Parse up to 15 parameters */
     size_t idx;
     size_t alloc = 0;
-    result.paramc = 0;
-    result.paramv = NULL;
+    reply.paramc = 0;
+    reply.paramv = NULL;
     bool last_parameter = false;
     for (;;) {
-        while (*message == ' ')
-            message += 1;
+        while (*text == ' ')
+            text += 1;
 
-        if (result.paramc == alloc) {
+        if (reply.paramc == alloc) {
             alloc = alloc ? alloc * 2 : 1;
-            result.paramv = realloc(result.paramv, alloc * sizeof *result.paramv);
-            if (!result.paramv)
+            reply.paramv = realloc(reply.paramv, alloc * sizeof *reply.paramv);
+            if (!reply.paramv)
                 fatal("Out of memory...");
         }
 
-        if (*message == ':') {
-            message += 1;
-            result.paramv[result.paramc++] = duplicate(message);
+        if (*text == ':') {
+            text += 1;
+            reply.paramv[reply.paramc++] = duplicate(text);
             break;
         }
 
         idx = 0;
-        while (message[idx] && message[idx] != ' ')
+        while (text[idx] && text[idx] != ' ')
             idx += 1;
 
-        if (message[idx])
-            message[idx] = '\0';
+        if (text[idx])
+            text[idx] = '\0';
         else
             last_parameter = true;
 
-        result.paramv[result.paramc++] = duplicate(message);
+        reply.paramv[reply.paramc++] = duplicate(text);
 
         if (last_parameter)
             break;
         else
-            message += idx + 1;
+            text += idx + 1;
     }
 
-    return result;
+    return reply;
 }
 
 static char *irc_receive(void)
@@ -384,6 +442,22 @@ static bool irc_wait_for(char const *success, char const *failure)
     }
 
     return false;
+}
+
+static void command_join(char *parameter)
+{
+    static char channel[128];
+
+    if (sscanf(parameter, "%128s", channel) != 1) {
+        warn("Invalid argument to /join: %s", parameter);
+        return;
+    }
+
+}
+
+static void command_raw(char *parameter)
+{
+    irc_send("%s", parameter);
 }
 
 static bool irc_authenticate
@@ -465,20 +539,33 @@ static void irc_privmsg(char *nick, char *channel, char *text)
 
 void handle_outbound_message(char *message)
 {
-    irc_send("%s", message);
-    free(message);
+    if (*message == '/') {
+        message += 1;
+        char *c = strchr(message, ' ');
+        if (c)  {
+            *c = '\0';
+            run_command(message, c + 1);
+        } else {
+            run_command(message, NULL);
+        }
+    } else {
+        irc_send("PRIVMSG %s :%s", room->target, message);
+        irc_privmsg(nick, room->target, message);
+    }
 }
 
 void handle_inbound_message(char *message)
 {
-    struct irc_message msg = irc_message_parse(message);
+    struct irc_reply msg = irc_reply_parse(message);
     free(message);
+
+    atomic_store(&should_render, true);
 
 #ifdef DEBUG
     irc_message_record(&msg);
 #endif
 
-    switch (msg.command) {
+    switch (msg.type) {
     case IRC_PING:
         atomic_store(&should_pong, true);
         break;
@@ -493,6 +580,8 @@ static int handle_input(TickitTerm *t, TickitEventType e, void *_info, void *dat
     TickitKeyEventInfo *info = _info;
 
     record("INPUT EVENT: %s\n", info->str);
+
+    atomic_store(&should_render, true);
 
     if (info->type == TICKIT_KEYEV_KEY) {
         if (!strcmp(info->str, "Enter")) {
@@ -581,6 +670,29 @@ void render_screen(TickitTerm *t)
     tickit_term_flush(t);
 }
 
+void run_command(char const *command, char *parameter)
+{
+    void (*f)(char *) = NULL;
+
+    for (size_t i = 0; i < command_count; ++i) {
+        if (strstr(command_table[i].name, command) == command_table[i].name) {
+            if (f) {
+                ambiguous_command(command);
+                return;
+            } else {
+                f = command_table[i].function;
+            }
+        }
+    }
+
+    if (!f) {
+        unknown_command(command);
+        return;
+    }
+
+    f(parameter);
+}
+
 int main(int argc, char *argv[])
 {
     /* Open log file for debugging */
@@ -627,7 +739,8 @@ int main(int argc, char *argv[])
         
         pthread_mutex_lock(&lock);
 
-        render_screen(t);
+        if (atomic_exchange(&should_render, false))
+            render_screen(t);
 
         pthread_mutex_unlock(&lock);
 
