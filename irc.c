@@ -635,39 +635,45 @@ void *inbound_listener(void *unused)
 
 void render_screen(TickitTerm *t)
 {
-    tickit_term_clear(t);
+    TickitRenderBuffer *buffer = tickit_renderbuffer_new(rows, columns);
 
     static size_t const offset = 12;
     static char timestamp_buffer[16];
+
+    record("=== DRAWING ===\n");
 
     /* Go backwards rendering the as many messages as can fit on the screen */
     size_t row = 2;
     size_t idx = 0;
     while (idx < message_count && row < rows) {
+        record("=== ROW: %zu ===\n", row);
+        record("=== IDX: %zu ===\n", idx);
         struct message msg = messages[message_count - idx - 1];
         struct tm *time_info = localtime(&msg.timestamp);
         strftime(timestamp_buffer, sizeof timestamp_buffer, "%H:%M:%S", time_info);
         size_t lines = column_count(msg.text) / (columns - offset) + 1;
-        tickit_term_goto(t, rows - row - lines - 1, 0);
-        tickit_term_printf(t, "[%s]", timestamp_buffer);
+        record("=== LINES: %zu ===\n", lines);
+        tickit_renderbuffer_goto(buffer, rows - row - lines - 1, 0);
+        tickit_renderbuffer_textf(buffer, "[%s]", timestamp_buffer);
         size_t to_write = strlen(msg.text);
         while (to_write > 0) {
             size_t n = fit_in_columns(msg.text, columns - offset);
-            tickit_term_goto(t, rows - row - lines - 1, offset);
-            tickit_term_printn(t, msg.text, n);
+            tickit_renderbuffer_goto(buffer, rows - row - lines - 1, offset);
+            tickit_renderbuffer_textn(buffer, msg.text, n);
             msg.text += n;
             to_write -= n;
-            lines -= 1;
+            row -= 1;
         }
         idx += 1;
-        row += lines;
+        row += 2 * lines;
     }
 
     /* Render input line at the bottom of the terminal */
-    tickit_term_goto(t, rows - 1, 0);
-    tickit_term_printf(t, "[%s]: %s", nick, input_buffer);
-
-    tickit_term_flush(t);
+    tickit_renderbuffer_goto(buffer, rows - 1, 0);
+    tickit_renderbuffer_textf(buffer, "[%s]: %s", nick, input_buffer);
+    
+    tickit_term_clear(t);
+    tickit_renderbuffer_flush_to_term(buffer, t);
 }
 
 void run_command(char const *command, char *parameter)
@@ -700,7 +706,7 @@ int main(int argc, char *argv[])
     if (!log_file)
         fatal("Failed to open log file");
 
-    nick = "marchelzo_";
+    nick = "marchelzo";
     host = "irc.freenode.net";
     port = "6667";
 
