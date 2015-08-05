@@ -22,6 +22,7 @@
 /* Forward declarations of command handlers */
 static void command_join(char *);
 static void command_raw(char *);
+static void command_msg(char *);
 
 enum irc_reply_type {
     IRC_ERROR,
@@ -99,7 +100,8 @@ typedef void (*command_function)(char *);
 
 struct { char const *name; command_function function; } command_table[] = {
     { "join", command_join },
-    { "raw",  command_raw }
+    { "raw",  command_raw },
+    { "msg",  command_msg }
 };
 
 static size_t const command_count = sizeof command_table / sizeof command_table[0];
@@ -124,6 +126,8 @@ struct { char const *string; enum irc_reply_type type; } irc_reply_table[] = {
 };
 
 static size_t const irc_replies = sizeof irc_reply_table / sizeof irc_reply_table[0];
+
+static struct nick_list const empty_nick_list = { 0, NULL };
 
 static int connection;
 
@@ -237,6 +241,30 @@ static void ambiguous_command(char const *command)
     return;
 }
 
+static void join_room(char *channel)
+{
+    if (room_count == room_alloc) {
+        room_alloc = room_alloc ? room_alloc * 2 : 1;
+        rooms = realloc(rooms, room_alloc * sizeof *rooms);
+        if (!rooms)
+            fatal("Out of memmory...");
+    }
+
+    struct room *new_room = rooms + room_count;
+
+    room_count += 1;
+
+    new_room->type = ROOM_CHANNEL;
+    new_room->target = channel;
+    new_room->nicks = empty_nick_list;
+
+    room = new_room;
+}
+
+/**
+ * The main message-drawing function. This is called whenever the
+ * message window needs to be re-drawn.
+ */
 static int expose_messages(TickitWindow *w, TickitEventType e, void *_info, void *data)
 {
     static size_t const offset = 12;
@@ -248,6 +276,11 @@ static int expose_messages(TickitWindow *w, TickitEventType e, void *_info, void
     TickitExposeEventInfo *info = _info;
     TickitRenderBuffer *buffer = info->rb;
     TickitRect rect = info->rect;
+
+    /* Prevent old messages reminaing on the screen if
+     * they aren't covered by new messagees.
+     */
+    tickit_renderbuffer_clear(buffer);
     
     /* Go backwards rendering the as many messages as can fit on the screen */
     size_t row = 0;
@@ -266,10 +299,19 @@ static int expose_messages(TickitWindow *w, TickitEventType e, void *_info, void
         tickit_renderbuffer_goto(buffer, rect.lines - row - lines - 1, 0);
         tickit_renderbuffer_textf(buffer, "[%s]", timestamp_buffer);
 
+	bool nick_drawn = false;
         size_t to_write = strlen(msg.text);
         while (to_write > 0) {
-            size_t n = fit_in_columns(msg.text, rect.cols - offset);
             tickit_renderbuffer_goto(buffer, rect.lines - row - lines - 1, offset);
+
+            size_t n;
+	    if (!nick_drawn++) {
+                n = fit_in_columns(msg.text, rect.cols - offset - column_count(nick));
+                tickit_renderbuffer_textf(buffer, "<%s> ", msg.nick);
+            } else {
+                n = fit_in_columns(msg.text, rect.cols - offset);
+            }
+
             tickit_renderbuffer_textn(buffer, msg.text, n);
             msg.text += n;
             to_write -= n;
@@ -541,11 +583,25 @@ static void command_join(char *parameter)
         return;
     }
 
+    irc_send("JOIN %s", channel);
 }
 
 static void command_raw(char *parameter)
 {
     irc_send("%s", parameter);
+}
+
+static void command_msg(char *parameter)
+{
+    static char target[256];
+    static int idx;
+
+    if (sscanf(parameter, "%255s%n", target, &idx) < 1) {
+        warn("Invalid argument to /msg: %s", parameter);
+        return;
+    }
+
+    irc_send("PRIVMSG %s :%s", target, parameter + idx);
 }
 
 static bool irc_authenticate
@@ -598,6 +654,10 @@ static bool irc_connect(char const *host, char const *port)
 
 static struct message *new_message(void)
 {
+    static time_t timestamp;
+
+    time(&timestamp);
+
     if (message_count == message_alloc) {
         message_alloc = message_alloc ? message_alloc * 2 : 1;
         messages = realloc(messages, message_alloc * sizeof *messages);
@@ -606,6 +666,7 @@ static struct message *new_message(void)
     }
 
     struct message *result = messages + message_count;
+    result->timestamp = timestamp;
 
     message_count += 1;
 
@@ -619,15 +680,13 @@ static struct message *new_message(void)
  */
 static void irc_privmsg(char *nick, char *channel, char *text)
 {
-    static time_t timestamp;
-
-    time(&timestamp);
-
     struct message *message = new_message();
 
-    message->channel = channel;
-    message->text = duplicate(buffer);
-    message->timestamp = timestamp;
+    message->type = MSG_NORMAL;
+
+    message->target = channel;
+    message->nick = nick;
+    message->text = text;
 }
 
 void handle_outbound_message(char *message)
@@ -641,9 +700,12 @@ void handle_outbound_message(char *message)
         } else {
             run_command(message, NULL);
         }
-    } else {
+    } else if (room) {
         irc_send("PRIVMSG %s :%s", room->target, message);
         irc_privmsg(nick, room->target, message);
+    } else {
+        /* We're not in a room. Send this directly to the server. */
+        irc_send("%s", message);
     }
 }
 
@@ -664,6 +726,12 @@ void handle_inbound_message(char *message)
         break;
     case IRC_PRIVMSG:
         irc_privmsg(msg.prefix.nick, msg.paramv[0], msg.paramv[1]);
+        break;
+    case IRC_JOIN:
+        if (!strcmp(msg.prefix.nick, nick))
+            join_room(msg.paramv[0]);
+        else
+            notify("%s has joined %s", msg.prefix.nick, msg.paramv[1]);
         break;
     }
 }
