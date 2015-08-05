@@ -9,6 +9,7 @@
 #include <stdatomic.h>
 #include <errno.h>
 #include <ctype.h>
+#include <assert.h>
 
 #include <unistd.h>
 #include <netdb.h>
@@ -78,8 +79,20 @@ struct room {
 
 struct message {
     time_t timestamp;
-    char *channel;
-    char *text;
+    enum { MSG_NORMAL, MSG_NOTIFICATION, MSG_SERVER, MSG_ACTION } type;
+    union {
+        struct {
+            char *target;
+            char *nick;
+            char *text;
+        };
+        struct {
+            char *notification;
+        };
+        struct {
+            char *server_message;
+        };
+    };
 };
 
 typedef void (*command_function)(char *);
@@ -136,7 +149,8 @@ static struct room *rooms;
 static size_t room_count;
 static size_t room_alloc;
 
-static atomic_bool should_render;
+static atomic_bool should_render_input_line = true;
+static atomic_bool should_render_messages = true;
 static atomic_bool should_pong;
 
 static FILE *log_file;
@@ -166,8 +180,6 @@ static void notify(char const *fmt, ...)
     va_list ap;
     va_start(ap, fmt);
     va_end(ap);
-
-    return;
 }
 
 static char *duplicate(char const *s)
@@ -204,7 +216,15 @@ static size_t fit_in_columns(char const *s, size_t n)
         while (idx && s[idx] && !isspace(s[idx]))
             idx -= 1;
 
-        return idx;
+        if (idx)
+            return idx;
+        else
+            return result.bytes;
+}
+
+static bool should_display(struct message const *message)
+{
+    return true;
 }
 
 static void unknown_command(char const *command)
@@ -215,6 +235,74 @@ static void unknown_command(char const *command)
 static void ambiguous_command(char const *command)
 {
     return;
+}
+
+static int expose_messages(TickitWindow *w, TickitEventType e, void *_info, void *data)
+{
+    static size_t const offset = 12;
+    static char timestamp_buffer[16];
+
+    if (!atomic_exchange(&should_render_messages, false))
+        return 1;
+
+    TickitExposeEventInfo *info = _info;
+    TickitRenderBuffer *buffer = info->rb;
+    TickitRect rect = info->rect;
+    
+    /* Go backwards rendering the as many messages as can fit on the screen */
+    size_t row = 0;
+    size_t idx = 0;
+    while (idx < message_count && row < rect.lines) {
+        struct message msg = messages[message_count - idx - 1];
+
+        if (!should_display(&msg))
+            continue;
+
+        struct tm *time_info = localtime(&msg.timestamp);
+        strftime(timestamp_buffer, sizeof timestamp_buffer, "%H:%M:%S", time_info);
+
+        size_t lines = column_count(msg.text) / (rect.cols - offset) + 1;
+
+        tickit_renderbuffer_goto(buffer, rect.lines - row - lines - 1, 0);
+        tickit_renderbuffer_textf(buffer, "[%s]", timestamp_buffer);
+
+        size_t to_write = strlen(msg.text);
+        while (to_write > 0) {
+            size_t n = fit_in_columns(msg.text, rect.cols - offset);
+            tickit_renderbuffer_goto(buffer, rect.lines - row - lines - 1, offset);
+            tickit_renderbuffer_textn(buffer, msg.text, n);
+            msg.text += n;
+            to_write -= n;
+            row -= 1;
+        }
+        idx += 1;
+        row += 2 * lines;
+    }
+
+    return 1;
+}
+
+static int expose_input_line(TickitWindow *w, TickitEventType e, void *_info, void *data)
+{
+    if (!atomic_exchange(&should_render_input_line, false))
+        return 1;
+
+    TickitExposeEventInfo *info = _info;
+    TickitRenderBuffer *buffer = info->rb;
+    TickitRect rect = info->rect;
+
+    tickit_renderbuffer_goto(buffer, 0, 0);
+    tickit_renderbuffer_erase(buffer, rect.cols);
+    tickit_renderbuffer_goto(buffer, 0, 0);
+    tickit_renderbuffer_textf(buffer, "[%s]: %s", nick, input_buffer);
+
+    int line;
+    int col;
+
+    tickit_renderbuffer_get_cursorpos(buffer, &line, &col);
+    tickit_window_cursor_at(w, line, col);
+
+    return 1;
 }
 
 static void irc_message_record(struct irc_reply const *reply)
@@ -508,6 +596,22 @@ static bool irc_connect(char const *host, char const *port)
     return true;
 }
 
+static struct message *new_message(void)
+{
+    if (message_count == message_alloc) {
+        message_alloc = message_alloc ? message_alloc * 2 : 1;
+        messages = realloc(messages, message_alloc * sizeof *messages);
+        if (!messages)
+            fatal("Out of memory...");
+    }
+
+    struct message *result = messages + message_count;
+
+    message_count += 1;
+
+    return result;
+}
+
 /* Helper functions for handling various 
  * events that occur throughout an IRC
  * session. e.g.: incoming PRIVMSG or NOTICE,
@@ -518,23 +622,12 @@ static void irc_privmsg(char *nick, char *channel, char *text)
     static time_t timestamp;
 
     time(&timestamp);
-    
-    if (message_count == message_alloc) {
-        message_alloc = message_alloc ? message_alloc * 2 : 1;
-        messages = realloc(messages, message_alloc * sizeof *messages);
-        if (!messages)
-            fatal("Out of memory...");
-    }
 
-    char buffer[1024];
+    struct message *message = new_message();
 
-    snprintf(buffer, 1024, "<%s>: %s", nick, text);
-
-    messages[message_count].channel = channel;
-    messages[message_count].text = duplicate(buffer);
-    messages[message_count].timestamp = timestamp;
-
-    message_count += 1;
+    message->channel = channel;
+    message->text = duplicate(buffer);
+    message->timestamp = timestamp;
 }
 
 void handle_outbound_message(char *message)
@@ -559,7 +652,7 @@ void handle_inbound_message(char *message)
     struct irc_reply msg = irc_reply_parse(message);
     free(message);
 
-    atomic_store(&should_render, true);
+    atomic_store(&should_render_messages, true);
 
 #ifdef DEBUG
     irc_message_record(&msg);
@@ -581,7 +674,7 @@ static int handle_input(TickitTerm *t, TickitEventType e, void *_info, void *dat
 
     record("INPUT EVENT: %s\n", info->str);
 
-    atomic_store(&should_render, true);
+    atomic_store(&should_render_input_line, true);
 
     if (info->type == TICKIT_KEYEV_KEY) {
         if (!strcmp(info->str, "Enter")) {
@@ -631,49 +724,6 @@ void *inbound_listener(void *unused)
     }
 
     return NULL;
-}
-
-void render_screen(TickitTerm *t)
-{
-    TickitRenderBuffer *buffer = tickit_renderbuffer_new(rows, columns);
-
-    static size_t const offset = 12;
-    static char timestamp_buffer[16];
-
-    record("=== DRAWING ===\n");
-
-    /* Go backwards rendering the as many messages as can fit on the screen */
-    size_t row = 2;
-    size_t idx = 0;
-    while (idx < message_count && row < rows) {
-        record("=== ROW: %zu ===\n", row);
-        record("=== IDX: %zu ===\n", idx);
-        struct message msg = messages[message_count - idx - 1];
-        struct tm *time_info = localtime(&msg.timestamp);
-        strftime(timestamp_buffer, sizeof timestamp_buffer, "%H:%M:%S", time_info);
-        size_t lines = column_count(msg.text) / (columns - offset) + 1;
-        record("=== LINES: %zu ===\n", lines);
-        tickit_renderbuffer_goto(buffer, rows - row - lines - 1, 0);
-        tickit_renderbuffer_textf(buffer, "[%s]", timestamp_buffer);
-        size_t to_write = strlen(msg.text);
-        while (to_write > 0) {
-            size_t n = fit_in_columns(msg.text, columns - offset);
-            tickit_renderbuffer_goto(buffer, rows - row - lines - 1, offset);
-            tickit_renderbuffer_textn(buffer, msg.text, n);
-            msg.text += n;
-            to_write -= n;
-            row -= 1;
-        }
-        idx += 1;
-        row += 2 * lines;
-    }
-
-    /* Render input line at the bottom of the terminal */
-    tickit_renderbuffer_goto(buffer, rows - 1, 0);
-    tickit_renderbuffer_textf(buffer, "[%s]: %s", nick, input_buffer);
-    
-    tickit_term_clear(t);
-    tickit_renderbuffer_flush_to_term(buffer, t);
 }
 
 void run_command(char const *command, char *parameter)
@@ -739,14 +789,30 @@ int main(int argc, char *argv[])
     tickit_term_bind_event(t, TICKIT_EV_KEY, handle_input, NULL);
     tickit_term_bind_event(t, TICKIT_EV_RESIZE, handle_resize, NULL);
 
+    TickitWindow *root_window = tickit_window_new_root(t);
+    TickitWindow *message_window = tickit_window_new_subwindow(root_window, 0, 0, rows - 1, columns);
+    TickitWindow *input_window = tickit_window_new_subwindow(root_window, rows - 1, 0, 1, columns);
+
+    assert(root_window);
+    assert(message_window);
+    assert(input_window);
+
+    assert(tickit_window_is_visible(root_window));
+    assert(tickit_window_is_visible(message_window));
+    assert(tickit_window_is_visible(input_window));
+
+    tickit_window_bind_event(message_window, TICKIT_EV_EXPOSE, expose_messages, NULL);
+    tickit_window_bind_event(input_window, TICKIT_EV_EXPOSE, expose_input_line, NULL);
+
     for (;;) {
         tickit_term_input_wait_msec(t, 100);
         tickit_term_refresh_size(t);
         
         pthread_mutex_lock(&lock);
 
-        if (atomic_exchange(&should_render, false))
-            render_screen(t);
+        tickit_window_tick(root_window);
+        tickit_window_expose(root_window, NULL);
+        tickit_window_take_focus(input_window);
 
         pthread_mutex_unlock(&lock);
 
