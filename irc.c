@@ -75,24 +75,17 @@ struct nick_list {
 struct room {
     enum { ROOM_PRIVATE, ROOM_CHANNEL } type;
     char *target;
+    char *topic;
     struct nick_list nicks;
 };
 
 struct message {
     time_t timestamp;
-    enum { MSG_NORMAL, MSG_NOTIFICATION, MSG_SERVER, MSG_ACTION } type;
-    union {
-        struct {
-            char *target;
-            char *nick;
-            char *text;
-        };
-        struct {
-            char *notification;
-        };
-        struct {
-            char *server_message;
-        };
+    enum { MSG_NORMAL, MSG_NOTIFICATION, MSG_SERVER, MSG_ACTION, MSG_WARNING } type;
+    struct {
+        char *target;
+        char *from;
+        char *text;
     };
 };
 
@@ -155,6 +148,7 @@ static size_t room_alloc;
 
 static atomic_bool should_render_input_line = true;
 static atomic_bool should_render_messages = true;
+static atomic_bool should_render_status = true;
 static atomic_bool should_pong;
 
 static FILE *log_file;
@@ -179,13 +173,6 @@ noreturn static void fatal(char const *fmt, ...)
     exit(EXIT_FAILURE);
 }
 
-static void notify(char const *fmt, ...)
-{
-    va_list ap;
-    va_start(ap, fmt);
-    va_end(ap);
-}
-
 static char *duplicate(char const *s)
 {
     size_t length = strlen(s);
@@ -198,6 +185,48 @@ static char *duplicate(char const *s)
     return result;
 }
 
+static struct room *get_room(int type, char const *name)
+{
+    for (size_t i = 0; i < room_count; ++i)
+        if (rooms[i].type == type && !strcmp(rooms[i].target, name))
+            return rooms + i;
+
+    return NULL;
+}
+
+static struct message *new_message(void)
+{
+    static time_t timestamp;
+
+    time(&timestamp);
+
+    if (message_count == message_alloc) {
+        message_alloc = message_alloc ? message_alloc * 2 : 1;
+        messages = realloc(messages, message_alloc * sizeof *messages);
+        if (!messages)
+            fatal("Out of memory...");
+    }
+
+    struct message *result = messages + message_count;
+    result->timestamp = timestamp;
+
+    message_count += 1;
+
+    return result;
+}
+
+static struct nick_node *new_nick_node(char const *nick)
+{
+    struct nick_node *node = malloc(sizeof *node);
+    if (!node)
+        fatal("Out of memory...");
+
+    node->nick = nick;
+    node->next = NULL;
+
+    return node;
+}
+
 static size_t column_count(char const *s)
 {
     static TickitStringPos limit = { -1, -1, -1, -1 };
@@ -205,7 +234,6 @@ static size_t column_count(char const *s)
 
     tickit_string_count(s, &result, &limit);
 
-    return result.columns;
 }
 
 static size_t fit_in_columns(char const *s, size_t n)
@@ -220,10 +248,47 @@ static size_t fit_in_columns(char const *s, size_t n)
         while (idx && s[idx] && !isspace(s[idx]))
             idx -= 1;
 
+        while (idx > 0 && s[idx] && isspace(s[idx - 1]))
+            idx -= 1;
+
         if (idx)
             return idx;
         else
             return result.bytes;
+}
+
+static void room_add_user(struct room *room, char const *nick)
+{
+    if (room->nicks.count == 0) {
+        room->nicks.count = 1;
+        room->nicks.head = new_nick_node(nick);
+    } else {
+        room->nicks.count += 1;
+        struct nick_node *node = room->nicks.head;
+
+        while (node->next)
+            node = node->next;
+
+        node->next = new_nick_node(nick);
+    }
+}
+
+static void notify(char const *fmt, ...)
+{
+    static char notification[1024];
+
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(notification, 1024, fmt, ap);
+    va_end(ap);
+
+    struct message *msg = new_message();
+
+    msg->type = MSG_NOTIFICATION;
+    msg->from = "Notification";
+    msg->text = duplicate(notification);
+
+    atomic_store(&should_render_messages, true);
 }
 
 static bool should_display(struct message const *message)
@@ -256,6 +321,7 @@ static void join_room(char *channel)
 
     new_room->type = ROOM_CHANNEL;
     new_room->target = channel;
+    new_room->topic = NULL;
     new_room->nicks = empty_nick_list;
 
     room = new_room;
@@ -267,7 +333,7 @@ static void join_room(char *channel)
  */
 static int expose_messages(TickitWindow *w, TickitEventType e, void *_info, void *data)
 {
-    static size_t const offset = 12;
+    static size_t const offset = 34;
     static char timestamp_buffer[16];
 
     if (!atomic_exchange(&should_render_messages, false))
@@ -284,8 +350,8 @@ static int expose_messages(TickitWindow *w, TickitEventType e, void *_info, void
     
     /* Go backwards rendering the as many messages as can fit on the screen */
     size_t row = 0;
-    size_t idx = 0;
-    while (idx < message_count && row < rect.lines) {
+    for (size_t idx = 0; idx < message_count && row < rect.lines; ++idx) {
+
         struct message msg = messages[message_count - idx - 1];
 
         if (!should_display(&msg))
@@ -294,32 +360,53 @@ static int expose_messages(TickitWindow *w, TickitEventType e, void *_info, void
         struct tm *time_info = localtime(&msg.timestamp);
         strftime(timestamp_buffer, sizeof timestamp_buffer, "%H:%M:%S", time_info);
 
-        size_t lines = column_count(msg.text) / (rect.cols - offset) + 1;
+        size_t span = column_count(msg.text) / (rect.cols - offset) + 1;
 
-        tickit_renderbuffer_goto(buffer, rect.lines - row - lines - 1, 0);
-        tickit_renderbuffer_textf(buffer, "[%s]", timestamp_buffer);
+        char from_buffer[20];
+        snprintf(from_buffer, 20, "<%s>", msg.from);
+        tickit_renderbuffer_goto(buffer, rect.lines - (row + span + 1), 0);
+        tickit_renderbuffer_textf(buffer, " [%s]  %18s ", timestamp_buffer, from_buffer);
 
-	bool nick_drawn = false;
-        size_t to_write = strlen(msg.text);
-        while (to_write > 0) {
-            tickit_renderbuffer_goto(buffer, rect.lines - row - lines - 1, offset);
+        size_t lines_used = 0;
+        while (*msg.text) {
+            size_t line_number = rect.lines + lines_used - (row + span + 1);
+            tickit_renderbuffer_goto(buffer, line_number, offset);
 
-            size_t n;
-	    if (!nick_drawn++) {
-                n = fit_in_columns(msg.text, rect.cols - offset - column_count(nick));
-                tickit_renderbuffer_textf(buffer, "<%s> ", msg.nick);
-            } else {
-                n = fit_in_columns(msg.text, rect.cols - offset);
-            }
+            record("Left to draw: `%s`\n", msg.text);
 
+            /* The message was split onto the next line here,
+             * so we can skip the next space (the newline suffices
+             * to separate the words)
+             */
+            if (lines_used > 0 && *msg.text == ' ')
+                msg.text += 1;
+
+            size_t n = fit_in_columns(msg.text, rect.cols - offset);
             tickit_renderbuffer_textn(buffer, msg.text, n);
+
             msg.text += n;
-            to_write -= n;
-            row -= 1;
+            lines_used += 1;
         }
-        idx += 1;
-        row += 2 * lines;
+        row += lines_used;
     }
+
+    tickit_renderbuffer_vline_at(
+            buffer,
+            0,
+            rect.lines - 1,
+            offset - 2,
+            TICKIT_LINE_DOUBLE,
+            TICKIT_LINECAP_START
+    );
+
+    tickit_renderbuffer_hline_at(
+            buffer,
+            rect.lines - 1,
+            0,
+            rect.cols - 1,
+            TICKIT_LINE_DOUBLE,
+            TICKIT_LINECAP_BOTH
+    );
 
     return 1;
 }
@@ -333,10 +420,19 @@ static int expose_input_line(TickitWindow *w, TickitEventType e, void *_info, vo
     TickitRenderBuffer *buffer = info->rb;
     TickitRect rect = info->rect;
 
+    tickit_renderbuffer_hline_at(
+            buffer,
+            1,
+            0,
+            rect.cols - 1,
+            TICKIT_LINE_DOUBLE,
+            TICKIT_LINECAP_BOTH
+    );
+
     tickit_renderbuffer_goto(buffer, 0, 0);
     tickit_renderbuffer_erase(buffer, rect.cols);
     tickit_renderbuffer_goto(buffer, 0, 0);
-    tickit_renderbuffer_textf(buffer, "[%s]: %s", nick, input_buffer);
+    record("Rendered input: %d\n", tickit_renderbuffer_textf(buffer, "[%s]: %s", nick, input_buffer));
 
     int line;
     int col;
@@ -345,6 +441,38 @@ static int expose_input_line(TickitWindow *w, TickitEventType e, void *_info, vo
     tickit_window_cursor_at(w, line, col);
 
     return 1;
+}
+
+static int expose_status(TickitWindow *w, TickitEventType e, void *_info, void *data)
+{
+    if (!atomic_exchange(&should_render_status, false))
+        return;
+
+    TickitExposeEventInfo *info = _info;
+    TickitRenderBuffer *buffer = info->rb;
+    TickitRect rect = info->rect;
+
+    tickit_renderbuffer_clear(buffer);
+
+    /* If we're not in a room, there's nothing
+     * interesting to display.
+     */
+    if (!room)
+        return;
+
+    tickit_renderbuffer_goto(buffer, 0, 0);
+
+    if (room->type == ROOM_CHANNEL) {
+        tickit_renderbuffer_textf(
+                buffer,
+                "Channel: %s     Users: %zu    Topic: %s",
+                room->target,
+                room->nicks.count,
+                room->topic
+        );
+    } else {
+        tickit_renderbuffer_textf(buffer, "Private messaging: %s", room->target);
+    }
 }
 
 static void irc_message_record(struct irc_reply const *reply)
@@ -652,25 +780,13 @@ static bool irc_connect(char const *host, char const *port)
     return true;
 }
 
-static struct message *new_message(void)
+static void handle_user_join(char *nick, char *channel)
 {
-    static time_t timestamp;
-
-    time(&timestamp);
-
-    if (message_count == message_alloc) {
-        message_alloc = message_alloc ? message_alloc * 2 : 1;
-        messages = realloc(messages, message_alloc * sizeof *messages);
-        if (!messages)
-            fatal("Out of memory...");
-    }
-
-    struct message *result = messages + message_count;
-    result->timestamp = timestamp;
-
-    message_count += 1;
-
-    return result;
+    struct room *room = get_room(ROOM_CHANNEL, channel);
+    assert(room);
+    room_add_user(room, nick);
+    notify("%s has join %s", nick, channel);
+    atomic_store(&should_render_status, true);
 }
 
 /* Helper functions for handling various 
@@ -685,7 +801,7 @@ static void irc_privmsg(char *nick, char *channel, char *text)
     message->type = MSG_NORMAL;
 
     message->target = channel;
-    message->nick = nick;
+    message->from = nick;
     message->text = text;
 }
 
@@ -730,8 +846,7 @@ void handle_inbound_message(char *message)
     case IRC_JOIN:
         if (!strcmp(msg.prefix.nick, nick))
             join_room(msg.paramv[0]);
-        else
-            notify("%s has joined %s", msg.prefix.nick, msg.paramv[1]);
+        handle_user_join(msg.prefix.nick, msg.paramv[0]);
         break;
     }
 }
@@ -759,6 +874,7 @@ static int handle_input(TickitTerm *t, TickitEventType e, void *_info, void *dat
         memcpy(input_buffer + input_length, info->str, length);
         input_length += length;
         input_buffer[input_length] = '\0';
+        record("Input Length: %zu\n", input_length);
     }
 
     return 0;
@@ -857,9 +973,27 @@ int main(int argc, char *argv[])
     tickit_term_bind_event(t, TICKIT_EV_KEY, handle_input, NULL);
     tickit_term_bind_event(t, TICKIT_EV_RESIZE, handle_resize, NULL);
 
+    /* The root window takes up the entire terminal */
     TickitWindow *root_window = tickit_window_new_root(t);
-    TickitWindow *message_window = tickit_window_new_subwindow(root_window, 0, 0, rows - 1, columns);
-    TickitWindow *input_window = tickit_window_new_subwindow(root_window, rows - 1, 0, 1, columns);
+
+    /* The message window has the same width as the terminal,
+     * but is three rows shorter to allow for the status and input
+     * windows
+     */
+    TickitWindow *message_window = tickit_window_new_subwindow(root_window, 0, 0, rows - 3, columns);
+
+    /* The input window also has the same width as the terminal,
+     * and is 2 rows high despite the input line being a
+     * single row. This is because the second row full of Unicode
+     * line-drawing characters is part of this window
+     */
+    TickitWindow *input_window = tickit_window_new_subwindow(root_window, rows - 3, 0, 2, columns);
+
+    /* A single row, the same width as the terminal for
+     * displaying information such as the channel you're
+     * currently in, its topic, number of users, etc.
+     */
+    TickitWindow *status_window = tickit_window_new_subwindow(root_window, rows - 1, 0, 1, columns);
 
     assert(root_window);
     assert(message_window);
@@ -871,6 +1005,7 @@ int main(int argc, char *argv[])
 
     tickit_window_bind_event(message_window, TICKIT_EV_EXPOSE, expose_messages, NULL);
     tickit_window_bind_event(input_window, TICKIT_EV_EXPOSE, expose_input_line, NULL);
+    tickit_window_bind_event(status_window, TICKIT_EV_EXPOSE, expose_status, NULL);
 
     for (;;) {
         tickit_term_input_wait_msec(t, 100);
