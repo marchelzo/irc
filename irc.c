@@ -23,6 +23,7 @@
 static void command_join(char *);
 static void command_raw(char *);
 static void command_msg(char *);
+static void command_action(char *);
 
 enum irc_reply_type {
     IRC_ERROR,
@@ -31,7 +32,7 @@ enum irc_reply_type {
     IRC_MOTD,
     IRC_MOTD_END,
     IRC_MOTD_START,
-    IRC_NAMES_REPLY,
+    IRC_NAMES,
     IRC_NAMES_END,
     IRC_NEED_MORE_PARAMS,
     IRC_NOTICE,
@@ -40,6 +41,8 @@ enum irc_reply_type {
     IRC_PING,
     IRC_PRIVMSG,
     IRC_QUIT,
+    IRC_TOPIC,
+    IRC_TOPIC_WHO_TIME,
     IRC_UNKNOWN_COMMAND,
     IRC_WELCOME
 };
@@ -81,7 +84,7 @@ struct room {
 
 struct message {
     time_t timestamp;
-    enum { MSG_NORMAL, MSG_NOTIFICATION, MSG_SERVER, MSG_ACTION, MSG_WARNING } type;
+    enum { MSG_CHANNEL, MSG_PRIVATE, MSG_NOTIFICATION, MSG_SERVER, MSG_ACTION, MSG_WARNING } type;
     struct {
         char *target;
         char *from;
@@ -94,7 +97,8 @@ typedef void (*command_function)(char *);
 struct { char const *name; command_function function; } command_table[] = {
     { "join", command_join },
     { "raw",  command_raw },
-    { "msg",  command_msg }
+    { "msg",  command_msg },
+    { "me",  command_action }
 };
 
 static size_t const command_count = sizeof command_table / sizeof command_table[0];
@@ -110,12 +114,14 @@ struct { char const *string; enum irc_reply_type type; } irc_reply_table[] = {
     { "PING",    IRC_PING },
     { "461",     IRC_NEED_MORE_PARAMS },
     { "421",     IRC_UNKNOWN_COMMAND },
-    { "353",     IRC_NAMES_REPLY },
+    { "353",     IRC_NAMES },
     { "366",     IRC_NAMES_END },
     { "001",     IRC_WELCOME },
     { "MODE",    IRC_MODE },
     { "QUIT",    IRC_QUIT },
-    { "JOIN",    IRC_JOIN }
+    { "JOIN",    IRC_JOIN },
+    { "332",     IRC_TOPIC },
+    { "333",     IRC_TOPIC_WHO_TIME }
 };
 
 static size_t const irc_replies = sizeof irc_reply_table / sizeof irc_reply_table[0];
@@ -129,8 +135,9 @@ static char *host;
 static char *port;
 static char *auth_string;
 
-static size_t input_length;
-static char input_buffer[1024];
+static size_t input_idx;
+static char *input_keys[1024];
+static char input_buffer[4096];
 
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -293,7 +300,13 @@ static void notify(char const *fmt, ...)
 
 static bool should_display(struct message const *message)
 {
-    return true;
+    if (!room && message->type == MSG_CHANNEL)
+        return false;
+
+    if (message->type != MSG_CHANNEL)
+        return true;
+
+    return !strcmp(message->target, room->target);
 }
 
 static void unknown_command(char const *command)
@@ -732,6 +745,14 @@ static void command_msg(char *parameter)
     irc_send("PRIVMSG %s :%s", target, parameter + idx);
 }
 
+static void command_action(char *parameter)
+{
+    if (!room)
+        return;
+
+    irc_send("PRIVMSG %s :%cACTION %s", room->target, 0x01, parameter);
+}
+
 static bool irc_authenticate
 (
     char const *nick,
@@ -785,8 +806,39 @@ static void handle_user_join(char *nick, char *channel)
     struct room *room = get_room(ROOM_CHANNEL, channel);
     assert(room);
     room_add_user(room, nick);
-    notify("%s has join %s", nick, channel);
+    notify("%s has joined %s", nick, channel);
     atomic_store(&should_render_status, true);
+}
+
+static void room_add_nicks(char const *channel, char *nicks)
+{
+    atomic_store(&should_render_status, true);
+
+    struct room *room = get_room(ROOM_CHANNEL, channel);
+    assert(room);
+
+    struct nick_node *node = room->nicks.head;
+
+    while (node->next)
+        node = node->next;
+
+    char *nick = strtok(nicks, " ");
+    while (nick) {
+        node->next = new_nick_node(nick);
+        node = node->next;
+        room->nicks.count += 1;
+        nick = strtok(NULL, " ");
+    }
+}
+
+static void room_set_topic(char const *channel, char *topic)
+{
+    atomic_store(&should_render_status, true);
+
+    struct room *room = get_room(ROOM_CHANNEL, channel);
+    assert(room);
+
+    room->topic = topic;
 }
 
 /* Helper functions for handling various 
@@ -794,13 +846,18 @@ static void handle_user_join(char *nick, char *channel)
  * session. e.g.: incoming PRIVMSG or NOTICE,
  * JOIN / PART notifications, etc.
  */
-static void irc_privmsg(char *nick, char *channel, char *text)
+static void irc_privmsg(char *nick, char *room, char *text)
 {
+    atomic_store(&should_render_messages, true);
+
     struct message *message = new_message();
 
-    message->type = MSG_NORMAL;
+    if (*room == '#')
+        message->type = MSG_CHANNEL;
+    else
+        message->type = MSG_PRIVATE;
 
-    message->target = channel;
+    message->target = room;
     message->from = nick;
     message->text = text;
 }
@@ -848,6 +905,12 @@ void handle_inbound_message(char *message)
             join_room(msg.paramv[0]);
         handle_user_join(msg.prefix.nick, msg.paramv[0]);
         break;
+    case IRC_NAMES:
+        room_add_nicks(msg.paramv[2], msg.paramv[3]);
+        break;
+    case IRC_TOPIC:
+        room_set_topic(msg.paramv[1], msg.paramv[2]);
+        break;
     }
 }
 
@@ -862,20 +925,20 @@ static int handle_input(TickitTerm *t, TickitEventType e, void *_info, void *dat
     if (info->type == TICKIT_KEYEV_KEY) {
         if (!strcmp(info->str, "Enter")) {
             handle_outbound_message(duplicate(input_buffer));
-            input_buffer[0] = '\0';
-            input_length = 0;
+            input_idx = 0;
         } else if (!strcmp(info->str, "C-c")) {
             exit(EXIT_SUCCESS);
-        } else if (input_length > 0 && !strcmp(info->str, "Backspace")) {
-            input_buffer[--input_length] = '\0';
+        } else if (input_idx > 0 && !strcmp(info->str, "Backspace")) {
+            input_idx -= 1;
         }
     } else {
-        unsigned length = strlen(info->str);
-        memcpy(input_buffer + input_length, info->str, length);
-        input_length += length;
-        input_buffer[input_length] = '\0';
-        record("Input Length: %zu\n", input_length);
+        input_keys[input_idx++] = duplicate(info->str);
     }
+
+    /* Recompute the contents of the input buffer */
+    input_buffer[0] = '\0';
+    for (size_t i = 0; i < input_idx; ++i)
+        strcat(input_buffer, input_keys[i]);
 
     return 0;
 }
@@ -1013,9 +1076,11 @@ int main(int argc, char *argv[])
         
         pthread_mutex_lock(&lock);
 
+        tickit_term_setctl_int(t, TICKIT_TERMCTL_CURSORVIS, 0);
         tickit_window_tick(root_window);
         tickit_window_expose(root_window, NULL);
         tickit_window_take_focus(input_window);
+        tickit_term_setctl_int(t, TICKIT_TERMCTL_CURSORVIS, 1);
 
         pthread_mutex_unlock(&lock);
 
