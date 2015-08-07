@@ -86,13 +86,11 @@ struct room {
 };
 
 struct message {
+    enum { MSG_NORMAL, MSG_NOTIFICATION, MSG_SERVER, MSG_ACTION, MSG_WARNING } type;
     time_t timestamp;
-    enum { MSG_CHANNEL, MSG_PRIVATE, MSG_NOTIFICATION, MSG_SERVER, MSG_ACTION, MSG_WARNING } type;
-    struct {
-        char *target;
-        char *from;
-        char *text;
-    };
+    char *target;
+    char *from;
+    char *text;
 };
 
 typedef void (*command_function)(char *);
@@ -309,13 +307,15 @@ static void warn(char const *fmt, ...)
 
 static bool should_display(struct message const *message)
 {
-    if (!room && message->type == MSG_CHANNEL)
-        return false;
+    if (message->type == MSG_NOTIFICATION)
+        return true;
 
     if (!room)
         return false;
 
-    return !strcmp(message->target, room->target) || message->type == MSG_NOTIFICATION;
+    record("Message target: `%s`    Current room target: `%s`\n", message->target, room->target);
+
+    return !strcmp(message->target, room->target);
 }
 
 static void unknown_command(char const *command)
@@ -363,8 +363,6 @@ static int expose_messages(TickitWindow *w, TickitEventType e, void *_info, void
     if (!atomic_exchange(&should_render_messages, false))
         return 1;
 
-    record("@@ABOUT TO DRAW MESSAGES\n");
-
     TickitExposeEventInfo *info = _info;
     TickitRenderBuffer *buffer = info->rb;
     TickitRect rect = info->rect;
@@ -380,12 +378,8 @@ static int expose_messages(TickitWindow *w, TickitEventType e, void *_info, void
 
         struct message msg = messages[message_count - idx - 1];
 
-        if (!should_display(&msg)) {
-            record("###$ MADE IT\n");
+        if (!should_display(&msg))
             continue;
-        }
-
-        record("## MADE IT\n");
 
         struct tm *time_info = localtime(&msg.timestamp);
         strftime(timestamp_buffer, sizeof timestamp_buffer, "%H:%M:%S", time_info);
@@ -401,8 +395,6 @@ static int expose_messages(TickitWindow *w, TickitEventType e, void *_info, void
         while (*msg.text) {
             size_t line_number = rect.lines + lines_used - (row + span + 1);
             tickit_renderbuffer_goto(buffer, line_number, offset);
-
-            record("Left to draw: `%s`\n", msg.text);
 
             /* The message was split onto the next line here,
              * so we can skip the next space (the newline suffices
@@ -898,14 +890,18 @@ static void irc_privmsg(char *nick, char *room, char *text)
 
     struct message *message = new_message();
 
-    if (*room == '#')
-        message->type = MSG_CHANNEL;
-    else
-        message->type = MSG_PRIVATE;
+    if (*text == 0x01) {
+        message->type = MSG_ACTION;
+        text += 8;
+        text[strlen(text) - 1] = '\0';
+    } else {
+        message->type = MSG_NORMAL;
+    }
 
     message->target = room;
     message->from = nick;
     message->text = text;
+
 }
 
 void handle_outbound_message(char *message)
@@ -944,7 +940,10 @@ void handle_inbound_message(char *message)
         atomic_store(&should_pong, true);
         break;
     case IRC_PRIVMSG:
-        irc_privmsg(msg.prefix.nick, msg.paramv[0], msg.paramv[1]);
+        if (!strcmp(msg.paramv[0], nick))
+            irc_privmsg(msg.prefix.nick, msg.prefix.nick, msg.paramv[1]);
+        else
+            irc_privmsg(msg.prefix.nick, msg.paramv[0], msg.paramv[1]);
         break;
     case IRC_JOIN:
         if (!strcmp(msg.prefix.nick, nick))
