@@ -475,16 +475,11 @@ static int expose_status(TickitWindow *w, TickitEventType e, void *_info, void *
 
     tickit_renderbuffer_goto(buffer, 0, 0);
 
-    if (room->type == ROOM_CHANNEL) {
-        tickit_renderbuffer_textf(
-                buffer,
-                "Channel: %s     Users: %zu    Topic: %s",
-                room->target,
-                room->nicks.count,
-                room->topic
-        );
-    } else {
-        tickit_renderbuffer_textf(buffer, "Private messaging: %s", room->target);
+    for (size_t i = 0; i < room_count; ++i) {
+        if (rooms + i == room)
+            tickit_renderbuffer_textf(buffer, " [ %s : %zu ]   ", rooms[i].target, rooms[i].nicks.count);
+        else
+            tickit_renderbuffer_textf(buffer, " %s   ", rooms[i].target);
     }
 }
 
@@ -930,6 +925,12 @@ static int handle_input(TickitTerm *t, TickitEventType e, void *_info, void *dat
             exit(EXIT_SUCCESS);
         } else if (input_idx > 0 && !strcmp(info->str, "Backspace")) {
             input_idx -= 1;
+        } else if (room && room != rooms && !strcmp(info->str, "M-Left")) {
+            atomic_store(&should_render_status, true);
+            room -= 1;
+        } else if (room && room != rooms + room_count - 1 && !strcmp(info->str, "M-Right")) {
+            atomic_store(&should_render_status, true);
+            room += 1;
         }
     } else {
         input_keys[input_idx++] = duplicate(info->str);
