@@ -19,11 +19,14 @@
 
 #include <tickit.h>
 
-/* Forward declarations of command handlers */
 static void command_join(char *);
 static void command_raw(char *);
 static void command_msg(char *);
 static void command_action(char *);
+static void command_part(char *);
+
+static void irc_privmsg(char *, char *, char *);
+static void run_command(char const *, char *);
 
 enum irc_reply_type {
     IRC_ERROR,
@@ -98,7 +101,8 @@ struct { char const *name; command_function function; } command_table[] = {
     { "join", command_join },
     { "raw",  command_raw },
     { "msg",  command_msg },
-    { "me",  command_action }
+    { "me",  command_action },
+    { "part",  command_part }
 };
 
 static size_t const command_count = sizeof command_table / sizeof command_table[0];
@@ -298,15 +302,20 @@ static void notify(char const *fmt, ...)
     atomic_store(&should_render_messages, true);
 }
 
+static void warn(char const *fmt, ...)
+{
+    return;
+}
+
 static bool should_display(struct message const *message)
 {
     if (!room && message->type == MSG_CHANNEL)
         return false;
 
-    if (message->type != MSG_CHANNEL)
-        return true;
+    if (!room)
+        return false;
 
-    return !strcmp(message->target, room->target);
+    return !strcmp(message->target, room->target) || message->type == MSG_NOTIFICATION;
 }
 
 static void unknown_command(char const *command)
@@ -319,8 +328,10 @@ static void ambiguous_command(char const *command)
     return;
 }
 
-static void join_room(char *channel)
+static void join_room(int type, char *target)
 {
+    atomic_store(&should_render_status, true);
+
     if (room_count == room_alloc) {
         room_alloc = room_alloc ? room_alloc * 2 : 1;
         rooms = realloc(rooms, room_alloc * sizeof *rooms);
@@ -332,8 +343,8 @@ static void join_room(char *channel)
 
     room_count += 1;
 
-    new_room->type = ROOM_CHANNEL;
-    new_room->target = channel;
+    new_room->type = type;
+    new_room->target = target;
     new_room->topic = NULL;
     new_room->nicks = empty_nick_list;
 
@@ -352,6 +363,8 @@ static int expose_messages(TickitWindow *w, TickitEventType e, void *_info, void
     if (!atomic_exchange(&should_render_messages, false))
         return 1;
 
+    record("@@ABOUT TO DRAW MESSAGES\n");
+
     TickitExposeEventInfo *info = _info;
     TickitRenderBuffer *buffer = info->rb;
     TickitRect rect = info->rect;
@@ -367,8 +380,12 @@ static int expose_messages(TickitWindow *w, TickitEventType e, void *_info, void
 
         struct message msg = messages[message_count - idx - 1];
 
-        if (!should_display(&msg))
+        if (!should_display(&msg)) {
+            record("###$ MADE IT\n");
             continue;
+        }
+
+        record("## MADE IT\n");
 
         struct tm *time_info = localtime(&msg.timestamp);
         strftime(timestamp_buffer, sizeof timestamp_buffer, "%H:%M:%S", time_info);
@@ -476,8 +493,10 @@ static int expose_status(TickitWindow *w, TickitEventType e, void *_info, void *
     tickit_renderbuffer_goto(buffer, 0, 0);
 
     for (size_t i = 0; i < room_count; ++i) {
-        if (rooms + i == room)
+        if (rooms + i == room && room->type == ROOM_CHANNEL)
             tickit_renderbuffer_textf(buffer, " [ %s : %zu ]   ", rooms[i].target, rooms[i].nicks.count);
+        else if (rooms + i == room && room->type == ROOM_PRIVATE)
+            tickit_renderbuffer_textf(buffer, " [ %s : private ]   ", rooms[i].target);
         else
             tickit_renderbuffer_textf(buffer, " %s   ", rooms[i].target);
     }
@@ -738,6 +757,19 @@ static void command_msg(char *parameter)
     }
 
     irc_send("PRIVMSG %s :%s", target, parameter + idx);
+    irc_privmsg(nick, target, parameter);
+
+    if (*target == '#') {
+        struct room *room = get_room(ROOM_CHANNEL, target);
+        if (room)
+            return;
+        command_join(target);
+    } else {
+        struct room *room = get_room(ROOM_PRIVATE, target);
+        if (room)
+            return;
+        join_room(ROOM_PRIVATE, target);
+    }
 }
 
 static void command_action(char *parameter)
@@ -746,6 +778,23 @@ static void command_action(char *parameter)
         return;
 
     irc_send("PRIVMSG %s :%cACTION %s", room->target, 0x01, parameter);
+}
+
+static void command_part(char *parameter)
+{
+    if (!room)
+        return;
+
+    atomic_store(&should_render_status, true);
+
+    if (room->type == ROOM_CHANNEL)
+        irc_send("PART %s :%s", room->target, parameter);
+
+    size_t room_idx = room - rooms;
+
+    memmove(room, room + 1, (room_count - room_idx) * sizeof (struct room));
+
+    room_count -= 1;
 }
 
 static bool irc_authenticate
@@ -798,11 +847,13 @@ static bool irc_connect(char const *host, char const *port)
 
 static void handle_user_join(char *nick, char *channel)
 {
+    atomic_store(&should_render_status, true);
+
     struct room *room = get_room(ROOM_CHANNEL, channel);
     assert(room);
     room_add_user(room, nick);
     notify("%s has joined %s", nick, channel);
-    atomic_store(&should_render_status, true);
+    record("@@@@ HERE\n");
 }
 
 static void room_add_nicks(char const *channel, char *nicks)
@@ -897,7 +948,7 @@ void handle_inbound_message(char *message)
         break;
     case IRC_JOIN:
         if (!strcmp(msg.prefix.nick, nick))
-            join_room(msg.paramv[0]);
+            join_room(ROOM_CHANNEL, msg.paramv[0]);
         handle_user_join(msg.prefix.nick, msg.paramv[0]);
         break;
     case IRC_NAMES:
@@ -931,6 +982,8 @@ static int handle_input(TickitTerm *t, TickitEventType e, void *_info, void *dat
         } else if (room && room != rooms + room_count - 1 && !strcmp(info->str, "M-Right")) {
             atomic_store(&should_render_status, true);
             room += 1;
+        } else if (room && !strcmp(info->str, "C-w")) {
+            command_part("Leaving...");
         }
     } else {
         input_keys[input_idx++] = duplicate(info->str);
