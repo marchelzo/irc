@@ -1183,9 +1183,6 @@ int main(int argc, char *argv[])
     if (!irc_connect(host, port))
         fatal("Couldn't connect to %s:%s", host, port);
 
-    record("Nick: `%s`\n", nick);
-    record("Username: `%s`\n", username);
-    record("Auth String: `%s`\n", auth_string);
     if (!irc_authenticate(nick, username, host, nick, auth_string))
         fatal("Failed to authenticate as user %s", username);
 
