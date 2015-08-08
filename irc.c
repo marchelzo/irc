@@ -132,9 +132,10 @@ static struct nick_list const empty_nick_list = { 0, NULL };
 
 static int connection;
 
-static char *nick;
 static char *host;
 static char *port;
+static char *nick;
+static char *username;
 static char *auth_string;
 
 static size_t cursor_bytes;
@@ -198,7 +199,7 @@ static char *duplicate(char const *s)
     return result;
 }
 
-static struct room *get_room(int type, char const *name)
+static struct room *get_room(unsigned type, char const *name)
 {
     for (size_t i = 0; i < room_count; ++i)
         if (rooms[i].type == type && !strcmp(rooms[i].target, name))
@@ -228,7 +229,7 @@ static struct message *new_message(void)
     return result;
 }
 
-static struct nick_node *new_nick_node(char const *nick)
+static struct nick_node *new_nick_node(char *nick)
 {
     struct nick_node *node = malloc(sizeof *node);
     if (!node)
@@ -247,6 +248,7 @@ static size_t column_count(char const *s)
 
     tickit_string_count(s, &result, &limit);
 
+    return result.columns;
 }
 
 static size_t fit_in_columns(char const *s, size_t n)
@@ -270,7 +272,7 @@ static size_t fit_in_columns(char const *s, size_t n)
             return result.bytes;
 }
 
-static void room_add_user(struct room *room, char const *nick)
+static void room_add_user(struct room *room, char *nick)
 {
     if (room->nicks.count == 0) {
         room->nicks.count = 1;
@@ -476,7 +478,7 @@ static int expose_input_line(TickitWindow *w, TickitEventType e, void *_info, vo
 static int expose_status(TickitWindow *w, TickitEventType e, void *_info, void *data)
 {
     if (!atomic_exchange(&should_render_status, false))
-        return;
+        return 1;
 
     TickitExposeEventInfo *info = _info;
     TickitRenderBuffer *buffer = info->rb;
@@ -488,7 +490,7 @@ static int expose_status(TickitWindow *w, TickitEventType e, void *_info, void *
      * interesting to display.
      */
     if (!room)
-        return;
+        return 1;
 
     tickit_renderbuffer_goto(buffer, 0, 0);
 
@@ -500,6 +502,8 @@ static int expose_status(TickitWindow *w, TickitEventType e, void *_info, void *
         else
             tickit_renderbuffer_textf(buffer, " %s   ", rooms[i].target);
     }
+
+    return 1;
 }
 
 static int scroll_messages(TickitWindow *t, TickitEventType e, void *_info, void *data)
@@ -751,6 +755,14 @@ static bool irc_wait_for(char const *success, char const *failure)
     return false;
 }
 
+static void input_insert(char *s)
+{
+    memmove(input_keys + input_idx + 1, input_keys + input_idx, (input_count - input_idx) * sizeof *input_keys);
+    input_keys[input_idx] = s;
+    input_idx += 1;
+    input_count += 1;
+}
+
 static void command_join(char *parameter)
 {
     static char channel[128];
@@ -867,14 +879,15 @@ static bool irc_connect(char const *host, char const *port)
     return true;
 }
 
-static void handle_user_join(char *nick, char *channel)
+static void handle_user_join(char *joined_nick, char *channel)
 {
     atomic_store(&should_render_status, true);
 
     struct room *room = get_room(ROOM_CHANNEL, channel);
     assert(room);
-    room_add_user(room, nick);
-    notify("%s has joined %s", nick, channel);
+    room_add_user(room, joined_nick);
+
+    notify("%s has joined %s", joined_nick, channel);
 }
 
 static void room_add_nicks(char const *channel, char *nicks)
@@ -889,12 +902,12 @@ static void room_add_nicks(char const *channel, char *nicks)
     while (node->next)
         node = node->next;
 
-    char *nick = strtok(nicks, " ");
-    while (nick) {
-        node->next = new_nick_node(nick);
+    for (char *n = strtok(nicks, " "); n; n = strtok(NULL, " ")) {
+        if (!strcmp(nick, n))
+            continue;
+        node->next = new_nick_node(n);
         node = node->next;
         room->nicks.count += 1;
-        nick = strtok(NULL, " ");
     }
 }
 
@@ -908,11 +921,6 @@ static void room_set_topic(char const *channel, char *topic)
     room->topic = topic;
 }
 
-/* Helper functions for handling various 
- * events that occur throughout an IRC
- * session. e.g.: incoming PRIVMSG or NOTICE,
- * JOIN / PART notifications, etc.
- */
 static void irc_privmsg(char *nick, char *room, char *text)
 {
     atomic_store(&should_render_messages, true);
@@ -931,6 +939,62 @@ static void irc_privmsg(char *nick, char *room, char *text)
     message->from = nick;
     message->text = text;
 
+}
+
+static void tab_completion(void)
+{
+    if (input_idx == 0)
+        return;
+
+    if (!room)
+        return;
+
+    size_t idx = input_idx - 1;
+    while (idx && *input_keys[idx] != ' ')
+        idx -= 1;
+
+    size_t start;
+    if (*input_keys[idx] != ' ')
+        start = idx;
+    else
+        start = idx + 1;
+
+    char prefix[512] = {0};
+    for (size_t i = start; i < input_idx; ++i)
+        strcat(prefix, input_keys[i]);
+
+    size_t length = strlen(prefix);
+
+    char *suggestion = NULL;
+    size_t checked = 0;
+    for (size_t i = 1; i <= message_count && checked < 50; ++i) {
+        struct message msg = messages[message_count - i];
+
+        if (msg.type != MSG_NORMAL)
+            continue;
+
+        if (strcmp(msg.target, room->target))
+            continue;
+
+        checked += 1;
+
+        if (strncmp(msg.from, prefix, length))
+            continue;
+
+        suggestion = malloc(strlen(msg.from) - length + 3);
+        if (!suggestion)
+            fatal("Out of memory...");
+
+        strcpy(suggestion, msg.from + length);
+        strcat(suggestion, ": ");
+
+        break;
+    }
+
+    if (!suggestion)
+        return;
+
+    input_insert(suggestion);
 }
 
 void handle_outbound_message(char *message)
@@ -985,6 +1049,8 @@ void handle_inbound_message(char *message)
     case IRC_TOPIC:
         room_set_topic(msg.paramv[1], msg.paramv[2]);
         break;
+    default:
+        break;
     }
 }
 
@@ -1019,12 +1085,17 @@ static int handle_input(TickitTerm *t, TickitEventType e, void *_info, void *dat
             input_idx -= 1;
         } else if (input_idx < input_count && !strcmp(info->str, "Right")) {
             input_idx += 1;
+        } else if (!strcmp(info->str, "C-a")) {
+            input_idx = 0;
+        } else if (!strcmp(info->str, "C-e")) {
+            input_idx = input_count;
+        } else if (!strcmp(info->str, "C-k")) {
+            input_count = input_idx;
+        } else if (!strcmp(info->str, "Tab")) {
+            tab_completion();
         }
     } else {
-        memmove(input_keys + input_idx + 1, input_keys + input_idx, (input_count - input_idx) * sizeof *input_keys);
-        input_keys[input_idx] = duplicate(info->str);
-        input_idx += 1;
-        input_count += 1;
+        input_insert(duplicate(info->str));
     }
 
     /* Re-construct the contents of the input buffer */
@@ -1035,8 +1106,6 @@ static int handle_input(TickitTerm *t, TickitEventType e, void *_info, void *dat
         if (i < input_idx)
             cursor_bytes += strlen(input_keys[i]);
     }
-
-    record("Input graphemes: %zu.    Input index: %zu.    Cursor bytes: %zu.\n", input_count, input_idx, cursor_bytes);
 
     return 0;
 }
@@ -1051,7 +1120,7 @@ static int handle_resize(TickitTerm *t, TickitEventType e, void *_info, void *da
     return 1;
 }
 
-void *inbound_listener(void *unused)
+static void *inbound_listener(void *unused)
 {
     char *message;
     for (;;) {
@@ -1067,7 +1136,7 @@ void *inbound_listener(void *unused)
     return NULL;
 }
 
-void run_command(char const *command, char *parameter)
+static void run_command(char const *command, char *parameter)
 {
     void (*f)(char *) = NULL;
 
@@ -1096,9 +1165,16 @@ int main(int argc, char *argv[])
     if (!log_file)
         fatal("Failed to open log file");
 
-    nick = "marchelzo";
     host = "irc.freenode.net";
     port = "6667";
+
+    nick = getenv("IRC_NICK");
+    if (!nick)
+        fatal("Couldn't get IRC_NICK from the environment");
+
+    username = getenv("IRC_USERNAME");
+    if (!username)
+        fatal("Couldn't get IRC_USERNAME from the environment");
 
     auth_string = getenv("IRC_AUTH_STRING");
     if (!auth_string)
@@ -1107,8 +1183,11 @@ int main(int argc, char *argv[])
     if (!irc_connect(host, port))
         fatal("Couldn't connect to %s:%s", host, port);
 
-    if (!irc_authenticate(nick, nick, host, nick, auth_string))
-        fatal("Failed to authenticate as user %s", nick);
+    record("Nick: `%s`\n", nick);
+    record("Username: `%s`\n", username);
+    record("Auth String: `%s`\n", auth_string);
+    if (!irc_authenticate(nick, username, host, nick, auth_string))
+        fatal("Failed to authenticate as user %s", username);
 
     /* Start handling messages from the server */
     pthread_t inbound_thread;

@@ -1,0 +1,39 @@
+#!/bin/bash
+
+cat <<END
+Basic usage:
+
+    /join <channel> to join a channel
+    /part [<message>] to leave a channel
+    /msg <target> <message> to send a PRIVMSG
+    /raw <text> to send raw text directly to the server
+    
+    M-Left to go to the previous channel
+    M-Right to go to next channel
+
+    The following behave as you would expect if you were using readline:
+        C-a
+        C-e
+        C-k
+
+    If you press Tab, the client will attempt to auto-complete
+    the word you are typing as a nickname of a user who has recently
+    spoken.
+
+    C-w is the same as doing /part.
+
+    Mouse-wheel scrolling is supported.
+
+    C-c to quit
+
+
+END
+
+read -p "Nick: " nick
+read -p "Username: " username
+read -s -p "Password: " password
+
+echo
+echo "Connecting..."
+
+IRC_AUTH_STRING=$(printf "$username\0$username\0$password" | base64) IRC_NICK="$nick" IRC_USERNAME="$username" ./irc
