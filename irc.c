@@ -225,6 +225,8 @@ static struct message *new_message(void)
     result->timestamp = timestamp;
 
     message_count += 1;
+    
+    atomic_store(&should_render_messages, true);
 
     return result;
 }
@@ -312,20 +314,35 @@ static void notify(char const *fmt, ...)
 
 static void warn(char const *fmt, ...)
 {
-    return;
+    static char warning[4096];
+
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(warning, sizeof warning, fmt, ap);
+    va_end(ap);
+
+    struct message *msg = new_message();
+
+    msg->text = duplicate(warning);
+    msg->type = MSG_WARNING;
+
+    if (room)
+        msg->target = room->target;
+    else
+        msg->target = NULL;
 }
 
 static bool should_display(struct message const *message)
 {
     if (!room)
-        return message->type == MSG_NOTIFICATION;
+        return message->type == MSG_NOTIFICATION || message->type == MSG_WARNING;
 
     return !strcmp(message->target, room->target);
 }
 
 static void unknown_command(char const *command)
 {
-    return;
+    warn("Unknown command: `%s`", command);
 }
 
 static void ambiguous_command(char const *command)
@@ -399,6 +416,8 @@ static int expose_messages(TickitWindow *w, TickitEventType e, void *_info, void
         char from_buffer[20] = {0};
         if (msg.type == MSG_NORMAL)
             snprintf(from_buffer, 20, "<%s>", msg.from);
+        else if (msg.type == MSG_WARNING)
+            strcpy(from_buffer, "!!!    ");
         tickit_renderbuffer_goto(buffer, rect.lines - (row + span + 1), 0);
         tickit_renderbuffer_textf(buffer, " [%s]  %18s ", timestamp_buffer, from_buffer);
 
@@ -820,13 +839,14 @@ static void command_part(char *parameter)
         return;
 
     atomic_store(&should_render_status, true);
+    atomic_store(&should_render_messages, true);
 
     if (room->type == ROOM_CHANNEL)
         irc_send("PART %s :%s", room->target, parameter);
 
     size_t room_idx = room - rooms;
 
-    memmove(room, room + 1, (room_count - room_idx) * sizeof (struct room));
+    memmove(room, room + 1, (room_count - room_idx) * sizeof *room);
 
     room_count -= 1;
 }
