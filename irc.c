@@ -137,7 +137,9 @@ static char *host;
 static char *port;
 static char *auth_string;
 
+static size_t cursor_bytes;
 static size_t input_idx;
+static size_t input_count;
 static char *input_keys[1024];
 static char input_buffer[4096];
 
@@ -145,6 +147,8 @@ static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 
 static int rows;
 static int columns;
+
+static size_t scroll_idx;
 
 static struct message *messages;
 static size_t message_count;
@@ -296,6 +300,11 @@ static void notify(char const *fmt, ...)
     msg->type = MSG_NOTIFICATION;
     msg->text = duplicate(notification);
 
+    if (room)
+        msg->target = room->target;
+    else
+        msg->target = NULL;
+
     atomic_store(&should_render_messages, true);
 }
 
@@ -306,13 +315,8 @@ static void warn(char const *fmt, ...)
 
 static bool should_display(struct message const *message)
 {
-    if (message->type == MSG_NOTIFICATION)
-        return true;
-
     if (!room)
-        return false;
-
-    record("Message target: `%s`    Current room target: `%s`\n", message->target, room->target);
+        return message->type == MSG_NOTIFICATION;
 
     return !strcmp(message->target, room->target);
 }
@@ -377,11 +381,12 @@ static int expose_messages(TickitWindow *w, TickitEventType e, void *_info, void
     
     /* Go backwards rendering the as many messages as can fit on the screen */
     size_t row = 0;
-    for (size_t idx = 0; idx < message_count && row < rect.lines; ++idx) {
+    size_t scroll = scroll_idx;
+    for (size_t idx = scroll_idx; idx < message_count && row < rect.lines; ++idx) {
 
         struct message msg = messages[message_count - idx - 1];
 
-        if (!should_display(&msg))
+        if (!should_display(&msg) || (scroll && --scroll))
             continue;
 
         struct tm *time_info = localtime(&msg.timestamp);
@@ -416,15 +421,6 @@ static int expose_messages(TickitWindow *w, TickitEventType e, void *_info, void
         row += lines_used;
     }
 
-    tickit_renderbuffer_vline_at(
-            buffer,
-            0,
-            rect.lines - 1,
-            offset - 2,
-            TICKIT_LINE_DOUBLE,
-            TICKIT_LINECAP_START
-    );
-
     tickit_renderbuffer_hline_at(
             buffer,
             rect.lines - 1,
@@ -439,6 +435,9 @@ static int expose_messages(TickitWindow *w, TickitEventType e, void *_info, void
 
 static int expose_input_line(TickitWindow *w, TickitEventType e, void *_info, void *data)
 {
+    static int line;
+    static int col;
+
     if (!atomic_exchange(&should_render_input_line, false))
         return 1;
 
@@ -455,13 +454,18 @@ static int expose_input_line(TickitWindow *w, TickitEventType e, void *_info, vo
             TICKIT_LINECAP_BOTH
     );
 
+    size_t offset = 0;
+    if (input_idx + column_count(nick) + 4 >= rect.cols)
+        offset = input_idx + column_count(nick) + 4 - rect.cols + 1;
+
     tickit_renderbuffer_goto(buffer, 0, 0);
     tickit_renderbuffer_erase(buffer, rect.cols);
     tickit_renderbuffer_goto(buffer, 0, 0);
-    record("Rendered input: %d\n", tickit_renderbuffer_textf(buffer, "[%s]: %s", nick, input_buffer));
+    tickit_renderbuffer_textf(buffer, "[%s]: %s", nick, input_buffer + offset);
 
-    int line;
-    int col;
+    tickit_renderbuffer_goto(buffer, 0, 0);
+    tickit_renderbuffer_textf(buffer, "[%s]: ", nick);
+    tickit_renderbuffer_textn(buffer, input_buffer + offset, cursor_bytes);
 
     tickit_renderbuffer_get_cursorpos(buffer, &line, &col);
     tickit_window_cursor_at(w, line, col);
@@ -496,6 +500,28 @@ static int expose_status(TickitWindow *w, TickitEventType e, void *_info, void *
         else
             tickit_renderbuffer_textf(buffer, " %s   ", rooms[i].target);
     }
+}
+
+static int scroll_messages(TickitWindow *t, TickitEventType e, void *_info, void *data)
+{
+    TickitMouseEventInfo *info = _info;
+
+    if (info->type != TICKIT_MOUSEEV_WHEEL)
+        return 1;
+
+    if (info->button == TICKIT_MOUSEWHEEL_UP) {
+        if (scroll_idx == message_count)
+            return 1;
+        scroll_idx += 1;
+    } else {
+        if (scroll_idx == 0)
+            return 1;
+        scroll_idx -= 1;
+    }
+
+    atomic_exchange(&should_render_messages, true);
+
+    return 1;
 }
 
 static void irc_message_record(struct irc_reply const *reply)
@@ -849,7 +875,6 @@ static void handle_user_join(char *nick, char *channel)
     assert(room);
     room_add_user(room, nick);
     notify("%s has joined %s", nick, channel);
-    record("@@@@ HERE\n");
 }
 
 static void room_add_nicks(char const *channel, char *nicks)
@@ -967,35 +992,51 @@ static int handle_input(TickitTerm *t, TickitEventType e, void *_info, void *dat
 {
     TickitKeyEventInfo *info = _info;
 
-    record("INPUT EVENT: %s\n", info->str);
-
     atomic_store(&should_render_input_line, true);
 
     if (info->type == TICKIT_KEYEV_KEY) {
         if (!strcmp(info->str, "Enter")) {
             handle_outbound_message(duplicate(input_buffer));
             input_idx = 0;
+            input_count = 0;
         } else if (!strcmp(info->str, "C-c")) {
             exit(EXIT_SUCCESS);
         } else if (input_idx > 0 && !strcmp(info->str, "Backspace")) {
+            memmove(input_keys + input_idx - 1, input_keys + input_idx, (input_count - input_idx) * sizeof *input_keys);
             input_idx -= 1;
+            input_count -= 1;
         } else if (room && room != rooms && !strcmp(info->str, "M-Left")) {
+            atomic_store(&should_render_messages, true);
             atomic_store(&should_render_status, true);
             room -= 1;
         } else if (room && room != rooms + room_count - 1 && !strcmp(info->str, "M-Right")) {
             atomic_store(&should_render_status, true);
+            atomic_store(&should_render_messages, true);
             room += 1;
         } else if (room && !strcmp(info->str, "C-w")) {
             command_part("Leaving...");
+        } else if (input_idx > 0 && !strcmp(info->str, "Left")) {
+            input_idx -= 1;
+        } else if (input_idx < input_count && !strcmp(info->str, "Right")) {
+            input_idx += 1;
         }
     } else {
-        input_keys[input_idx++] = duplicate(info->str);
+        memmove(input_keys + input_idx + 1, input_keys + input_idx, (input_count - input_idx) * sizeof *input_keys);
+        input_keys[input_idx] = duplicate(info->str);
+        input_idx += 1;
+        input_count += 1;
     }
 
-    /* Recompute the contents of the input buffer */
+    /* Re-construct the contents of the input buffer */
     input_buffer[0] = '\0';
-    for (size_t i = 0; i < input_idx; ++i)
+    cursor_bytes = 0;
+    for (size_t i = 0; i < input_count; ++i) {
         strcat(input_buffer, input_keys[i]);
+        if (i < input_idx)
+            cursor_bytes += strlen(input_keys[i]);
+    }
+
+    record("Input graphemes: %zu.    Input index: %zu.    Cursor bytes: %zu.\n", input_count, input_idx, cursor_bytes);
 
     return 0;
 }
@@ -1017,12 +1058,8 @@ void *inbound_listener(void *unused)
         message = irc_receive();
 
         pthread_mutex_lock(&lock);
-
-        record("LISTENER: GOT LOCK\n");
-        
-        pthread_mutex_unlock(&lock);
-
         handle_inbound_message(message);
+        pthread_mutex_unlock(&lock);
 
         usleep(10000);
     }
@@ -1055,7 +1092,6 @@ void run_command(char const *command, char *parameter)
 
 int main(int argc, char *argv[])
 {
-    /* Open log file for debugging */
     log_file = fopen("LOG", "w");
     if (!log_file)
         fatal("Failed to open log file");
@@ -1066,7 +1102,7 @@ int main(int argc, char *argv[])
 
     auth_string = getenv("IRC_AUTH_STRING");
     if (!auth_string)
-        fatal("Couldn't find IRC_AUTH_STRING environment variable");
+        fatal("Couldn't get IRC_AUTH_STRING from the environment");
 
     if (!irc_connect(host, port))
         fatal("Couldn't connect to %s:%s", host, port);
@@ -1089,30 +1125,15 @@ int main(int argc, char *argv[])
 
     tickit_term_setctl_int(t, TICKIT_TERMCTL_CURSORVIS, 1);
     tickit_term_setctl_int(t, TICKIT_TERMCTL_ALTSCREEN, 1);
+    tickit_term_setctl_int(t, TICKIT_TERMCTL_MOUSE, TICKIT_TERM_MOUSEMODE_DRAG);
 
     tickit_term_bind_event(t, TICKIT_EV_KEY, handle_input, NULL);
     tickit_term_bind_event(t, TICKIT_EV_RESIZE, handle_resize, NULL);
 
-    /* The root window takes up the entire terminal */
     TickitWindow *root_window = tickit_window_new_root(t);
 
-    /* The message window has the same width as the terminal,
-     * but is three rows shorter to allow for the status and input
-     * windows
-     */
     TickitWindow *message_window = tickit_window_new_subwindow(root_window, 0, 0, rows - 3, columns);
-
-    /* The input window also has the same width as the terminal,
-     * and is 2 rows high despite the input line being a
-     * single row. This is because the second row full of Unicode
-     * line-drawing characters is part of this window
-     */
     TickitWindow *input_window = tickit_window_new_subwindow(root_window, rows - 3, 0, 2, columns);
-
-    /* A single row, the same width as the terminal for
-     * displaying information such as the channel you're
-     * currently in, its topic, number of users, etc.
-     */
     TickitWindow *status_window = tickit_window_new_subwindow(root_window, rows - 1, 0, 1, columns);
 
     assert(root_window);
@@ -1126,6 +1147,8 @@ int main(int argc, char *argv[])
     tickit_window_bind_event(message_window, TICKIT_EV_EXPOSE, expose_messages, NULL);
     tickit_window_bind_event(input_window, TICKIT_EV_EXPOSE, expose_input_line, NULL);
     tickit_window_bind_event(status_window, TICKIT_EV_EXPOSE, expose_status, NULL);
+
+    tickit_window_bind_event(message_window, TICKIT_EV_MOUSE, scroll_messages, NULL);
 
     for (;;) {
         tickit_term_input_wait_msec(t, 100);
