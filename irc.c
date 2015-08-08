@@ -294,7 +294,6 @@ static void notify(char const *fmt, ...)
     struct message *msg = new_message();
 
     msg->type = MSG_NOTIFICATION;
-    msg->from = "Notification";
     msg->text = duplicate(notification);
 
     atomic_store(&should_render_messages, true);
@@ -328,7 +327,7 @@ static void ambiguous_command(char const *command)
     return;
 }
 
-static void join_room(int type, char *target)
+static void join_room(char *target)
 {
     atomic_store(&should_render_status, true);
 
@@ -343,10 +342,14 @@ static void join_room(int type, char *target)
 
     room_count += 1;
 
-    new_room->type = type;
     new_room->target = target;
     new_room->topic = NULL;
     new_room->nicks = empty_nick_list;
+
+    if (*target == '#')
+        new_room->type = ROOM_CHANNEL;
+    else
+        new_room->type = ROOM_PRIVATE;
 
     room = new_room;
 }
@@ -386,8 +389,9 @@ static int expose_messages(TickitWindow *w, TickitEventType e, void *_info, void
 
         size_t span = column_count(msg.text) / (rect.cols - offset) + 1;
 
-        char from_buffer[20];
-        snprintf(from_buffer, 20, "<%s>", msg.from);
+        char from_buffer[20] = {0};
+        if (msg.type == MSG_NORMAL)
+            snprintf(from_buffer, 20, "<%s>", msg.from);
         tickit_renderbuffer_goto(buffer, rect.lines - (row + span + 1), 0);
         tickit_renderbuffer_textf(buffer, " [%s]  %18s ", timestamp_buffer, from_buffer);
 
@@ -760,7 +764,7 @@ static void command_msg(char *parameter)
         struct room *room = get_room(ROOM_PRIVATE, target);
         if (room)
             return;
-        join_room(ROOM_PRIVATE, target);
+        join_room(target);
     }
 }
 
@@ -947,7 +951,7 @@ void handle_inbound_message(char *message)
         break;
     case IRC_JOIN:
         if (!strcmp(msg.prefix.nick, nick))
-            join_room(ROOM_CHANNEL, msg.paramv[0]);
+            join_room(msg.paramv[0]);
         handle_user_join(msg.prefix.nick, msg.paramv[0]);
         break;
     case IRC_NAMES:
