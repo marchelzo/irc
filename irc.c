@@ -428,7 +428,7 @@ static int expose_messages(TickitWindow *w, TickitEventType e, void *_info, void
             rect.lines - 1,
             0,
             rect.cols - 1,
-            TICKIT_LINE_DOUBLE,
+            TICKIT_LINE_SINGLE,
             TICKIT_LINECAP_BOTH
     );
 
@@ -452,7 +452,7 @@ static int expose_input_line(TickitWindow *w, TickitEventType e, void *_info, vo
             1,
             0,
             rect.cols - 1,
-            TICKIT_LINE_DOUBLE,
+            TICKIT_LINE_SINGLE,
             TICKIT_LINECAP_BOTH
     );
 
