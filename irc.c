@@ -83,6 +83,7 @@ struct room {
     char *target;
     char *topic;
     struct nick_list nicks;
+    atomic_uchar activity;
 };
 
 struct message {
@@ -94,7 +95,6 @@ struct message {
 };
 
 typedef void (*command_function)(char *);
-
 struct { char const *name; command_function function; } command_table[] = {
     { "join", command_join },
     { "raw",  command_raw },
@@ -129,6 +129,38 @@ struct { char const *string; enum irc_reply_type type; } irc_reply_table[] = {
 static size_t const irc_replies = sizeof irc_reply_table / sizeof irc_reply_table[0];
 
 static struct nick_list const empty_nick_list = { 0, NULL };
+
+enum {
+    ACTIVITY_NONE = 0,
+    ACTIVITY_NORMAL = 1,
+    ACTIVITY_IMPORTANT = 2
+};
+
+static struct {
+    int background;
+    int normal;
+    int warning;
+    int notification;
+    int timestamp;
+    int my_nick;
+    int nick;
+    int nick_mentioned;
+    int action;
+    int activity;
+    int important_activity;
+} colors = {
+    0,
+    230,
+    31,
+    103,
+    234,
+    62,
+    107,
+    172,
+    192,
+    165,
+    14
+};
 
 static int connection;
 
@@ -165,6 +197,8 @@ static atomic_bool should_render_messages = true;
 static atomic_bool should_render_status = true;
 static atomic_bool should_pong;
 
+static TickitPen *default_pen;
+
 static FILE *log_file;
 
 static void record(char const *fmt, ...)
@@ -199,10 +233,28 @@ static char *duplicate(char const *s)
     return result;
 }
 
-static struct room *get_room(unsigned type, char const *name)
+int render_as_color(TickitRenderBuffer *rb, int color, char *fmt, ...)
+{
+    static TickitPen *pen;
+
+    if (!pen)
+        pen = tickit_pen_new_attrs(TICKIT_PEN_BG, colors.background, -1);
+
+    tickit_pen_set_colour_attr(pen, TICKIT_PEN_FG, color);
+    tickit_renderbuffer_setpen(rb, pen);
+
+    va_list ap;
+    va_start(ap, fmt);
+    int ret = tickit_renderbuffer_vtextf(rb, fmt, ap);
+    va_end(ap);
+
+    return ret;
+}
+
+static struct room *get_room(char const *target)
 {
     for (size_t i = 0; i < room_count; ++i)
-        if (rooms[i].type == type && !strcmp(rooms[i].target, name))
+        if (!strcmp(rooms[i].target, target))
             return rooms + i;
 
     return NULL;
@@ -290,7 +342,24 @@ static void room_add_user(struct room *room, char *nick)
     }
 }
 
-static void notify(char const *fmt, ...)
+static void room_remove_user(struct room *room, char *nick)
+{
+        struct nick_node *node = room->nicks.head;
+
+        if (!node)
+            return;
+
+        while (node->next && strcmp(node->next->nick, nick))
+            node = node->next;
+        
+        if (!node->next)
+            return;
+
+        room->nicks.count -= 1;
+        node->next = node->next->next;
+}
+
+static void notify(char *target, char const *fmt, ...)
 {
     static char notification[1024];
 
@@ -303,12 +372,8 @@ static void notify(char const *fmt, ...)
 
     msg->type = MSG_NOTIFICATION;
     msg->text = duplicate(notification);
-
-    if (room)
-        msg->target = room->target;
-    else
-        msg->target = NULL;
-
+    msg->target = target;
+    
     atomic_store(&should_render_messages, true);
 }
 
@@ -397,6 +462,13 @@ static int expose_messages(TickitWindow *w, TickitEventType e, void *_info, void
      * they aren't covered by new messagees.
      */
     tickit_renderbuffer_clear(buffer);
+
+    /* Clear the new activity flag on the current room, since it's
+     * no longer new (we're looking at it right now).
+     */
+    if (room)
+        atomic_store(&room->activity, ACTIVITY_NONE);
+
     
     /* Go backwards rendering the as many messages as can fit on the screen */
     size_t row = 0;
@@ -419,7 +491,11 @@ static int expose_messages(TickitWindow *w, TickitEventType e, void *_info, void
         else if (msg.type == MSG_WARNING)
             strcpy(from_buffer, "!!!    ");
         tickit_renderbuffer_goto(buffer, rect.lines - (row + span + 1), 0);
-        tickit_renderbuffer_textf(buffer, " [%s]  %18s ", timestamp_buffer, from_buffer);
+        render_as_color(buffer, colors.timestamp, " [%s]  ", timestamp_buffer);
+        if (msg.type == MSG_NORMAL && !strcmp(msg.from, nick))
+            render_as_color(buffer, colors.my_nick, "%18s ", from_buffer);
+        else
+            render_as_color(buffer, colors.nick, "%18s ", from_buffer);
 
         size_t lines_used = 0;
         while (*msg.text) {
@@ -434,13 +510,29 @@ static int expose_messages(TickitWindow *w, TickitEventType e, void *_info, void
                 msg.text += 1;
 
             size_t n = fit_in_columns(msg.text, rect.cols - offset);
-            tickit_renderbuffer_textn(buffer, msg.text, n);
+            
+            char save = msg.text[n];
+            msg.text[n] = '\0';
+            char *our_nick = strstr(msg.text, nick);
+            if (our_nick && our_nick - msg.text + strlen(nick) <= n) {
+                *our_nick = '\0';
+                render_as_color(buffer, colors.normal, "%s", msg.text);
+                render_as_color(buffer, colors.nick_mentioned, "%s", nick);
+                render_as_color(buffer, colors.normal, "%s", our_nick + strlen(nick));
+                *our_nick = *nick;
+            } else {
+                render_as_color(buffer, colors.normal, "%s", msg.text);
+            }
+
+            msg.text[n] = save;
 
             msg.text += n;
             lines_used += 1;
         }
         row += lines_used;
     }
+
+    tickit_renderbuffer_setpen(buffer, default_pen);
 
     tickit_renderbuffer_hline_at(
             buffer,
@@ -476,16 +568,16 @@ static int expose_input_line(TickitWindow *w, TickitEventType e, void *_info, vo
     );
 
     size_t offset = 0;
-    if (input_idx + column_count(nick) + 4 >= rect.cols)
-        offset = input_idx + column_count(nick) + 4 - rect.cols + 1;
+    if (column_count(input_buffer) + column_count(nick) + 5 >= rect.cols)
+        offset = fit_in_columns(input_buffer, column_count(input_buffer) + column_count(nick) + 5 - rect.cols + 1);
 
     tickit_renderbuffer_goto(buffer, 0, 0);
     tickit_renderbuffer_erase(buffer, rect.cols);
     tickit_renderbuffer_goto(buffer, 0, 0);
-    tickit_renderbuffer_textf(buffer, "[%s]: %s", nick, input_buffer + offset);
+    tickit_renderbuffer_textf(buffer, " [%s]: %s", nick, input_buffer + offset);
 
     tickit_renderbuffer_goto(buffer, 0, 0);
-    tickit_renderbuffer_textf(buffer, "[%s]: ", nick);
+    tickit_renderbuffer_textf(buffer, " [%s]: ", nick);
     tickit_renderbuffer_textn(buffer, input_buffer + offset, cursor_bytes);
 
     tickit_renderbuffer_get_cursorpos(buffer, &line, &col);
@@ -513,13 +605,26 @@ static int expose_status(TickitWindow *w, TickitEventType e, void *_info, void *
 
     tickit_renderbuffer_goto(buffer, 0, 0);
 
+    int color;
     for (size_t i = 0; i < room_count; ++i) {
-        if (rooms + i == room && room->type == ROOM_CHANNEL)
-            tickit_renderbuffer_textf(buffer, " [ %s : %zu ]   ", rooms[i].target, rooms[i].nicks.count);
-        else if (rooms + i == room && room->type == ROOM_PRIVATE)
-            tickit_renderbuffer_textf(buffer, " [ %s : private ]   ", rooms[i].target);
+
+        unsigned char activity = atomic_load(&rooms[i].activity);
+
+        record("=== ACTIVITY FROM %s: ", rooms[i].target);
+
+        if (activity == ACTIVITY_IMPORTANT)
+            record("IMPORTANT\n"), color = colors.important_activity;
+        else if (activity == ACTIVITY_NORMAL)
+            record("NORMAL\n"), color = colors.activity;
         else
-            tickit_renderbuffer_textf(buffer, " %s   ", rooms[i].target);
+            record("NONE\n"), color = colors.normal;
+
+        if (rooms + i == room && room->type == ROOM_CHANNEL)
+            render_as_color(buffer, color, " [ %s : %zu ]   ", rooms[i].target, rooms[i].nicks.count);
+        else if (rooms + i == room && room->type == ROOM_PRIVATE)
+            render_as_color(buffer, color, " [ %s : private ]   ", rooms[i].target);
+        else
+            render_as_color(buffer, color, " %s   ", rooms[i].target);
     }
 
     return 1;
@@ -715,7 +820,7 @@ static char *irc_receive(void)
 
     while (read(connection, &c, 1) == 1) {
         if (length == alloc) {
-            alloc = alloc * 2 + 2;
+            alloc = alloc * 2 + 4;
             message = realloc(message, alloc);
             if (!message) fatal("Out of memory...");
         }
@@ -812,17 +917,15 @@ static void command_msg(char *parameter)
     irc_send("PRIVMSG %s :%s", target, parameter + idx);
     irc_privmsg(nick, target, parameter);
 
-    if (*target == '#') {
-        struct room *room = get_room(ROOM_CHANNEL, target);
-        if (room)
-            return;
+    struct room *room = get_room(target);
+
+    if (room)
+        return;
+
+    if (*target == '#')
         command_join(target);
-    } else {
-        struct room *room = get_room(ROOM_PRIVATE, target);
-        if (room)
-            return;
+    else
         join_room(target);
-    }
 }
 
 static void command_action(char *parameter)
@@ -903,18 +1006,34 @@ static void handle_user_join(char *joined_nick, char *channel)
 {
     atomic_store(&should_render_status, true);
 
-    struct room *room = get_room(ROOM_CHANNEL, channel);
+    struct room *room = get_room(channel);
     assert(room);
+
     room_add_user(room, joined_nick);
 
-    notify("%s has joined %s", joined_nick, channel);
+    notify(channel, "%s has joined %s", joined_nick, channel);
+}
+
+static void handle_user_part(char *parting_nick, char *channel, char *message)
+{
+    atomic_store(&should_render_status, true);
+
+    struct room *room = get_room(channel);
+    assert(room);
+
+    room_remove_user(room, parting_nick);
+
+    if (message)
+        notify(channel, "%s has left %s (%s)", parting_nick, channel, message);
+    else
+        notify(channel, "%s has left %s", parting_nick, channel);
 }
 
 static void room_add_nicks(char const *channel, char *nicks)
 {
     atomic_store(&should_render_status, true);
 
-    struct room *room = get_room(ROOM_CHANNEL, channel);
+    struct room *room = get_room(channel);
     assert(room);
 
     struct nick_node *node = room->nicks.head;
@@ -935,13 +1054,13 @@ static void room_set_topic(char const *channel, char *topic)
 {
     atomic_store(&should_render_status, true);
 
-    struct room *room = get_room(ROOM_CHANNEL, channel);
+    struct room *room = get_room(channel);
     assert(room);
 
     room->topic = topic;
 }
 
-static void irc_privmsg(char *nick, char *room, char *text)
+static void irc_privmsg(char *from, char *target, char *text)
 {
     atomic_store(&should_render_messages, true);
 
@@ -955,9 +1074,16 @@ static void irc_privmsg(char *nick, char *room, char *text)
         message->type = MSG_NORMAL;
     }
 
-    message->target = room;
-    message->from = nick;
+    message->target = target;
+    message->from = from;
     message->text = text;
+    
+    if (room && strcmp(room->target, target)) {
+        struct room *r = get_room(target);
+        assert(r);
+        atomic_store(&r->activity, ACTIVITY_NORMAL);
+        atomic_store(&should_render_status, true);
+    }
 
 }
 
@@ -1062,6 +1188,12 @@ void handle_inbound_message(char *message)
         if (!strcmp(msg.prefix.nick, nick))
             join_room(msg.paramv[0]);
         handle_user_join(msg.prefix.nick, msg.paramv[0]);
+        break;
+    case IRC_PART:
+        if (strcmp(msg.prefix.nick, nick)) {
+            char *message = msg.paramc == 2 ? msg.paramv[1] : NULL;
+            handle_user_part(msg.prefix.nick, msg.paramv[0], message);
+        }
         break;
     case IRC_NAMES:
         room_add_nicks(msg.paramv[2], msg.paramv[3]);
@@ -1210,6 +1342,8 @@ int main(int argc, char *argv[])
     pthread_t inbound_thread;
     if (pthread_create(&inbound_thread, NULL, inbound_listener, NULL) != 0)
         fatal("Failed to spawn inbound listener thread");
+
+    default_pen = tickit_pen_new();
 
     TickitTerm *t = tickit_term_open_stdio();
     if (!t)
