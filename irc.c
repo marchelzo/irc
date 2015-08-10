@@ -152,7 +152,7 @@ static struct {
     0,
     230,
     31,
-    103,
+    241,
     237,
     62,
     107,
@@ -203,11 +203,13 @@ static FILE *log_file;
 
 static void record(char const *fmt, ...)
 {
+#ifdef DEBUG
     va_list ap;
     va_start(ap, fmt);
     vfprintf(log_file, fmt, ap);
     va_end(ap);
     fflush(log_file);
+#endif
 }
 
 noreturn static void fatal(char const *fmt, ...)
@@ -226,7 +228,8 @@ static char *duplicate(char const *s)
     size_t length = strlen(s);
     char *result = malloc(length + 1);
 
-    if (!result) fatal("Out of memory...");
+    if (!result)
+        fatal("Out of memory...");
 
     strcpy(result, s);
 
@@ -320,10 +323,14 @@ static size_t fit_in_columns(char const *s, size_t n)
         while (idx > 0 && s[idx] && isspace(s[idx - 1]))
             idx -= 1;
 
-        if (idx)
+
+        if (idx) {
+            record("Returning idx: %zu\n", idx);
             return idx;
-        else
+        } else {
+            record("Returning result.bytes: %zu\n", result.bytes);
             return result.bytes;
+        }
 }
 
 static void room_add_user(struct room *room, char *nick)
@@ -454,6 +461,8 @@ static int expose_messages(TickitWindow *w, TickitEventType e, void *_info, void
     if (!atomic_exchange(&should_render_messages, false))
         return 1;
 
+    record("BEGINNING EXPOSE_MESSAGES\n");
+
     TickitExposeEventInfo *info = _info;
     TickitRenderBuffer *buffer = info->rb;
     TickitRect rect = info->rect;
@@ -474,7 +483,7 @@ static int expose_messages(TickitWindow *w, TickitEventType e, void *_info, void
     size_t row = 0;
     size_t scroll = scroll_idx;
     for (size_t idx = scroll_idx; idx < message_count && row < rect.lines; ++idx) {
-
+        record("LOOPING: %zu\n", idx);
         struct message msg = messages[message_count - idx - 1];
 
         int color = colors.normal;
@@ -508,6 +517,8 @@ static int expose_messages(TickitWindow *w, TickitEventType e, void *_info, void
             size_t line_number = rect.lines + lines_used - (row + span + 1);
             tickit_renderbuffer_goto(buffer, line_number, offset);
 
+            record("LEFT TO WRITE (%zu): `%s`\n", strlen(msg.text), msg.text);
+
             size_t n = fit_in_columns(msg.text, rect.cols - offset);
 
             /* The nickname portion of an ACTION message is
@@ -524,8 +535,10 @@ static int expose_messages(TickitWindow *w, TickitEventType e, void *_info, void
              * so we can skip the next space (the newline suffices
              * to separate the words)
              */
-            if (lines_used > 0 && *msg.text == ' ')
+            if (lines_used > 0 && *msg.text == ' ') {
                 msg.text += 1;
+                n -= 1;
+            }
 
             char save = msg.text[n];
             msg.text[n] = '\0';
@@ -543,9 +556,16 @@ static int expose_messages(TickitWindow *w, TickitEventType e, void *_info, void
                 render_as_color(buffer, color, "%s", msg.text);
             }
 
+            record("n: %zu\n", n);
+            record("save: %d\n", save);
+            record("msg.text: `%s`\n", msg.text);
+            record("bytes: %zu\n", strlen(msg.text));
+
             msg.text[n] = save;
 
             msg.text += n;
+
+            record("msg.text after adding n: `%s`\n", msg.text);
             lines_used += 1;
         }
         row += lines_used;
@@ -562,6 +582,7 @@ static int expose_messages(TickitWindow *w, TickitEventType e, void *_info, void
             TICKIT_LINECAP_BOTH
     );
 
+    record("FINISHED EXPOSE_MESSAGES\n");
     return 1;
 }
 
@@ -572,6 +593,8 @@ static int expose_input_line(TickitWindow *w, TickitEventType e, void *_info, vo
 
     if (!atomic_exchange(&should_render_input_line, false))
         return 1;
+
+    record("BEGINNING EXPOSE_INPUT\n");
 
     TickitExposeEventInfo *info = _info;
     TickitRenderBuffer *buffer = info->rb;
@@ -602,6 +625,8 @@ static int expose_input_line(TickitWindow *w, TickitEventType e, void *_info, vo
     tickit_renderbuffer_get_cursorpos(buffer, &line, &col);
     tickit_window_cursor_at(w, line, col);
 
+    record("FINISHED EXPOSE_INPUT\n");
+
     return 1;
 }
 
@@ -609,6 +634,8 @@ static int expose_status(TickitWindow *w, TickitEventType e, void *_info, void *
 {
     if (!atomic_exchange(&should_render_status, false))
         return 1;
+
+    record("BEGINNING EXPOSE_STATUS\n");
 
     TickitExposeEventInfo *info = _info;
     TickitRenderBuffer *buffer = info->rb;
@@ -629,14 +656,12 @@ static int expose_status(TickitWindow *w, TickitEventType e, void *_info, void *
 
         unsigned char activity = atomic_load(&rooms[i].activity);
 
-        record("=== ACTIVITY FROM %s: ", rooms[i].target);
-
         if (activity == ACTIVITY_IMPORTANT)
-            record("IMPORTANT\n"), color = colors.important_activity;
+            color = colors.important_activity;
         else if (activity == ACTIVITY_NORMAL)
-            record("NORMAL\n"), color = colors.activity;
+            color = colors.activity;
         else
-            record("NONE\n"), color = colors.normal;
+            color = colors.normal;
 
         if (rooms + i == room && room->type == ROOM_CHANNEL)
             render_as_color(buffer, color, " [ %s : %zu ]   ", rooms[i].target, rooms[i].nicks.count);
@@ -645,6 +670,8 @@ static int expose_status(TickitWindow *w, TickitEventType e, void *_info, void *
         else
             render_as_color(buffer, color, " %s   ", rooms[i].target);
     }
+
+    record("FINISHED EXPOSE_STATUS\n");
 
     return 1;
 }
@@ -1194,9 +1221,7 @@ void handle_inbound_message(char *message)
 
     atomic_store(&should_render_messages, true);
 
-#ifdef DEBUG
     irc_message_record(&msg);
-#endif
 
     switch (msg.type) {
     case IRC_PING:
@@ -1299,12 +1324,17 @@ static int handle_resize(TickitTerm *t, TickitEventType e, void *_info, void *da
 static void *inbound_listener(void *unused)
 {
     char *message;
+    record("STARTING INBOUND LISTEN LOOP\n");
     for (;;) {
         message = irc_receive();
 
+        record("LISTENER: LOCKING\n");
         pthread_mutex_lock(&lock);
+        record("LISTENER: LOCKED\n");
         handle_inbound_message(message);
+        record("LISTENER: UNLOCKING\n");
         pthread_mutex_unlock(&lock);
+        record("LISTENER: UNLOCKED\n");
 
         usleep(10000);
     }
@@ -1364,6 +1394,7 @@ int main(int argc, char *argv[])
 
     /* Start handling messages from the server */
     pthread_t inbound_thread;
+    record("STARTING LISTENER THREAD\n");
     if (pthread_create(&inbound_thread, NULL, inbound_listener, NULL) != 0)
         fatal("Failed to spawn inbound listener thread");
 
@@ -1408,18 +1439,26 @@ int main(int argc, char *argv[])
         tickit_term_input_wait_msec(t, 100);
         tickit_term_refresh_size(t);
         
+        record("MAIN: LOCKING\n");
         pthread_mutex_lock(&lock);
+        record("MAIN: LOCKED\n");
 
         tickit_term_setctl_int(t, TICKIT_TERMCTL_CURSORVIS, 0);
+        record("CALLING TICK\n");
         tickit_window_tick(root_window);
+        record("CALLED TICK\n");
+        record("CALLING EXPOSE\n");
         tickit_window_expose(root_window, NULL);
+        record("CALLED EXPOSE\n");
         tickit_window_take_focus(input_window);
         tickit_term_setctl_int(t, TICKIT_TERMCTL_CURSORVIS, 1);
 
-        pthread_mutex_unlock(&lock);
-
         if (atomic_exchange(&should_pong, false))
             irc_send("PONG");
+
+        record("MAIN: UNLOCKING\n");
+        pthread_mutex_unlock(&lock);
+        record("MAIN: UNLOCKED\n");
     }
 
     return 0;
