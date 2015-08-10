@@ -153,7 +153,7 @@ static struct {
     230,
     31,
     103,
-    234,
+    237,
     62,
     107,
     172,
@@ -448,7 +448,7 @@ static void join_room(char *target)
  */
 static int expose_messages(TickitWindow *w, TickitEventType e, void *_info, void *data)
 {
-    static size_t const offset = 34;
+    static size_t const offset = 32;
     static char timestamp_buffer[16];
 
     if (!atomic_exchange(&should_render_messages, false))
@@ -477,6 +477,12 @@ static int expose_messages(TickitWindow *w, TickitEventType e, void *_info, void
 
         struct message msg = messages[message_count - idx - 1];
 
+        int color = colors.normal;
+        if (msg.type == MSG_WARNING)
+            color = colors.warning;
+        else if (msg.type == MSG_NOTIFICATION)
+            color = colors.notification;
+
         if (!should_display(&msg) || (scroll && --scroll))
             continue;
 
@@ -502,6 +508,18 @@ static int expose_messages(TickitWindow *w, TickitEventType e, void *_info, void
             size_t line_number = rect.lines + lines_used - (row + span + 1);
             tickit_renderbuffer_goto(buffer, line_number, offset);
 
+            size_t n = fit_in_columns(msg.text, rect.cols - offset);
+
+            /* The nickname portion of an ACTION message is
+             * a special case, since it goes in the message
+             * part of the window rather than where nicks
+             * usually go.
+             */
+            if (msg.type == MSG_ACTION && lines_used == 0) {
+                render_as_color(buffer, colors.action, "%s ", msg.from);
+                n = fit_in_columns(msg.text, rect.cols - offset - column_count(msg.from) - 1);
+            }
+
             /* The message was split onto the next line here,
              * so we can skip the next space (the newline suffices
              * to separate the words)
@@ -509,19 +527,20 @@ static int expose_messages(TickitWindow *w, TickitEventType e, void *_info, void
             if (lines_used > 0 && *msg.text == ' ')
                 msg.text += 1;
 
-            size_t n = fit_in_columns(msg.text, rect.cols - offset);
-            
             char save = msg.text[n];
             msg.text[n] = '\0';
             char *our_nick = strstr(msg.text, nick);
-            if (our_nick && our_nick - msg.text + strlen(nick) <= n) {
+            bool occurrence =  our_nick
+                            && (our_nick == msg.text || !isalnum(*(our_nick - 1)))
+                            && !isalnum(*(our_nick + strlen(nick)));
+            if (occurrence && our_nick - msg.text + strlen(nick) <= n) {
                 *our_nick = '\0';
-                render_as_color(buffer, colors.normal, "%s", msg.text);
+                render_as_color(buffer, color, "%s", msg.text);
                 render_as_color(buffer, colors.nick_mentioned, "%s", nick);
-                render_as_color(buffer, colors.normal, "%s", our_nick + strlen(nick));
+                render_as_color(buffer, color, "%s", our_nick + strlen(nick));
                 *our_nick = *nick;
             } else {
-                render_as_color(buffer, colors.normal, "%s", msg.text);
+                render_as_color(buffer, color, "%s", msg.text);
             }
 
             msg.text[n] = save;
@@ -930,10 +949,15 @@ static void command_msg(char *parameter)
 
 static void command_action(char *parameter)
 {
+    static char action_buffer[2048];
+
     if (!room)
         return;
 
-    irc_send("PRIVMSG %s :%cACTION %s", room->target, 0x01, parameter);
+    snprintf(action_buffer, sizeof action_buffer, "%cACTION %s%c", 0x01, parameter, 0x01);
+
+    irc_send("PRIVMSG %s :%s", room->target, action_buffer);
+    irc_privmsg(nick, room->target, duplicate(action_buffer));
 }
 
 static void command_part(char *parameter)
@@ -1002,7 +1026,7 @@ static bool irc_connect(char const *host, char const *port)
     return true;
 }
 
-static void handle_user_join(char *joined_nick, char *channel)
+static void handle_user_join(char *joined_nick, char *joined_user, char *joined_host, char *channel)
 {
     atomic_store(&should_render_status, true);
 
@@ -1011,7 +1035,7 @@ static void handle_user_join(char *joined_nick, char *channel)
 
     room_add_user(room, joined_nick);
 
-    notify(channel, "%s has joined %s", joined_nick, channel);
+    notify(channel, "%s has joined %s (%s!%s@%s)", joined_nick, channel, joined_nick, joined_user, joined_host);
 }
 
 static void handle_user_part(char *parting_nick, char *channel, char *message)
@@ -1187,7 +1211,7 @@ void handle_inbound_message(char *message)
     case IRC_JOIN:
         if (!strcmp(msg.prefix.nick, nick))
             join_room(msg.paramv[0]);
-        handle_user_join(msg.prefix.nick, msg.paramv[0]);
+        handle_user_join(msg.prefix.nick, msg.prefix.user, msg.prefix.host, msg.paramv[0]);
         break;
     case IRC_PART:
         if (strcmp(msg.prefix.nick, nick)) {
