@@ -1,6 +1,6 @@
 #!/bin/bash
 
-cat <<END
+cat <<EOF
 Basic usage:
 
     /join <channel> to join a channel
@@ -27,13 +27,41 @@ Basic usage:
     C-c to quit
 
 
-END
+Please enter your information for connecting to freenode, and
+a configuration file will be generated for you.
+
+EOF
 
 read -p "Nick: " nick
 read -p "Username: " username
 read -s -p "Password: " password
 
 echo
-echo "Connecting..."
+echo "Setting up configuration file..."
 
-IRC_AUTH_STRING=$(printf "$username\0$username\0$password" | base64) IRC_NICK="$nick" IRC_USERNAME="$username" ./irc
+cat > ~/.irc.conf <<EOF
+[user]
+nick = $nick
+username = $username
+auth = $(printf "$username\0$username\0$password" | base64)
+
+[colors]
+background = 0
+normal = 230
+warning = 31
+notification = 241
+timestamp = 237
+nick = 62
+mynick = 107
+mention = 172
+action = 192
+activity = 165
+important = 14
+
+[channels]
+; channels listed here will be auto-joined on startup
+;##c
+;#freenode
+EOF
+
+echo "Done! You can find the configuration file at ~/.irc.conf"

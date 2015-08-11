@@ -166,9 +166,12 @@ static int connection;
 
 static char *host;
 static char *port;
-static char *nick;
-static char *username;
-static char *auth_string;
+static struct {
+    char *nick;
+    char *username;
+    char *real_name;
+    char *auth_string;
+} user;
 
 static size_t cursor_bytes;
 static size_t input_idx;
@@ -234,6 +237,112 @@ static char *duplicate(char const *s)
     strcpy(result, s);
 
     return result;
+}
+
+static void load_color(char const *s)
+{
+    char element[32];
+    char color[32];
+
+    if (sscanf(s, "%31s = %31s", element, color) == 2) {
+        char *end;
+        long value = strtol(color, &end, 10);
+        if (*end)
+            goto error;
+        if (value < 0 || value > 255)
+            goto error;
+        if (!strcmp(element, "background"))
+            colors.background = value;
+        else if (!strcmp(element, "normal"))
+            colors.normal = value;
+        else if (!strcmp(element, "warning"))
+            colors.warning = value;
+        else if (!strcmp(element, "notification"))
+            colors.notification = value;
+        else if (!strcmp(element, "timestamp"))
+            colors.timestamp = value;
+        else if (!strcmp(element, "nick"))
+            colors.nick = value;
+        else if (!strcmp(element, "mynick"))
+            colors.my_nick = value;
+        else if (!strcmp(element, "mention"))
+            colors.nick_mentioned = value;
+        else if (!strcmp(element, "action"))
+            colors.action = value;
+        else if (!strcmp(element, "activity"))
+            colors.activity = value;
+        else if (!strcmp(element, "important"))
+            colors.important_activity = value;
+        else
+            goto error;
+    } else goto error;
+    
+    return;
+
+error:
+    fatal("Invalid color setting in configuration file: `%s`\n"\
+          "See the default configuration for a list of valid options.\n"\
+          "Color values must be between 0 and 255 (inclusive).");
+}
+
+static void load_user(char const *s)
+{
+    char setting[32];
+    char value[128];
+
+    if (sscanf(s, "%31s = %127s", setting, value) != 2)
+        goto error;
+
+    printf("`%s` : `%s`\n", setting, value);
+
+    if (!strcmp(setting, "nick"))
+        user.nick = duplicate(value);
+    else if (!strcmp(setting, "username"))
+        user.username = duplicate(value);
+    else if (!strcmp(setting, "auth"))
+        user.auth_string = duplicate(value);
+    else
+        goto error;
+
+    return;
+
+error:
+    fatal("Invalid user setting in configuration file: `%s`\n"\
+          "See the default configuration for examples of valid "\
+          "user settings.");
+}
+
+static void load_channel(char const *s)
+{
+    
+}
+
+static void load_configuration(FILE *f)
+{
+    char buffer[1024];
+
+    void (*load)(char const *) = NULL;
+    while (fgets(buffer, 1024, f)) {
+        char *end = strchr(buffer, ';');
+        if (end)
+            *end = '\0';
+        if (!*buffer || *buffer == '\n')
+            continue;
+
+        char section[32];
+        if (sscanf(buffer, "[%[^]]]", section) == 1) {
+            if (!strcmp(section, "user"))
+                load = load_user;
+            else if (!strcmp(section, "colors"))
+                load = load_color;
+            else if (!strcmp(section, "channels"))
+                load = load_channel;
+            else
+                fatal("Invalid section in configuration file: `%s`", section);
+        } else {
+            load(buffer);
+        }
+    }
 }
 
 int render_as_color(TickitRenderBuffer *rb, int color, char *fmt, ...)
@@ -514,7 +623,7 @@ static int expose_messages(TickitWindow *w, TickitEventType e, void *_info, void
             strcpy(from_buffer, "!!!    ");
         tickit_renderbuffer_goto(buffer, rect.lines - (row + span + 1), 0);
         render_as_color(buffer, colors.timestamp, " [%s]  ", timestamp_buffer);
-        if (msg.type == MSG_NORMAL && !strcmp(msg.from, nick))
+        if (msg.type == MSG_NORMAL && !strcmp(msg.from, user.nick))
             render_as_color(buffer, colors.my_nick, "%18s ", from_buffer);
         else
             render_as_color(buffer, colors.nick, "%18s ", from_buffer);
@@ -549,16 +658,16 @@ static int expose_messages(TickitWindow *w, TickitEventType e, void *_info, void
 
             char save = msg.text[n];
             msg.text[n] = '\0';
-            char *our_nick = strstr(msg.text, nick);
+            char *our_nick = strstr(msg.text, user.nick);
             bool occurrence =  our_nick
                             && (our_nick == msg.text || !isalnum(*(our_nick - 1)))
-                            && !isalnum(*(our_nick + strlen(nick)));
+                            && !isalnum(*(our_nick + strlen(user.nick)));
             if (occurrence) {
                 *our_nick = '\0';
                 render_as_color(buffer, color, "%s", msg.text);
-                render_as_color(buffer, colors.nick_mentioned, "%s", nick);
-                render_as_color(buffer, color, "%s", our_nick + strlen(nick));
-                *our_nick = *nick;
+                render_as_color(buffer, colors.nick_mentioned, "%s", user.nick);
+                render_as_color(buffer, color, "%s", our_nick + strlen(user.nick));
+                *our_nick = *user.nick;
             } else {
                 render_as_color(buffer, color, "%s", msg.text);
             }
@@ -619,17 +728,17 @@ static int expose_input_line(TickitWindow *w, TickitEventType e, void *_info, vo
     size_t offset = 0;
     char save = input_buffer[cursor_bytes];
     input_buffer[cursor_bytes] = '\0';
-    if (column_count(input_buffer) + column_count(nick) + 6 >= rect.cols)
-        offset = fit_in_columns(input_buffer, column_count(input_buffer) + column_count(nick) + 6 - rect.cols + 1, false);
+    if (column_count(input_buffer) + column_count(user.nick) + 6 >= rect.cols)
+        offset = fit_in_columns(input_buffer, column_count(input_buffer) + column_count(user.nick) + 6 - rect.cols + 1, false);
     input_buffer[cursor_bytes] = save;
 
     tickit_renderbuffer_goto(buffer, 0, 0);
     tickit_renderbuffer_erase(buffer, rect.cols);
     tickit_renderbuffer_goto(buffer, 0, 0);
-    tickit_renderbuffer_textf(buffer, " [%s]: %s", nick, input_buffer + offset);
+    tickit_renderbuffer_textf(buffer, " [%s]: %s", user.nick, input_buffer + offset);
 
     tickit_renderbuffer_goto(buffer, 0, 0);
-    tickit_renderbuffer_textf(buffer, " [%s]: ", nick);
+    tickit_renderbuffer_textf(buffer, " [%s]: ", user.nick);
     tickit_renderbuffer_textn(buffer, input_buffer + offset, cursor_bytes - offset);
 
     tickit_renderbuffer_get_cursorpos(buffer, &line, &col);
@@ -971,7 +1080,7 @@ static void command_msg(char *parameter)
     }
 
     irc_send("PRIVMSG %s :%s", target, parameter + idx);
-    irc_privmsg(nick, target, parameter);
+    irc_privmsg(user.nick, target, parameter);
 
     struct room *room = get_room(target);
 
@@ -994,7 +1103,7 @@ static void command_action(char *parameter)
     snprintf(action_buffer, sizeof action_buffer, "%cACTION %s%c", 0x01, parameter, 0x01);
 
     irc_send("PRIVMSG %s :%s", room->target, action_buffer);
-    irc_privmsg(nick, room->target, duplicate(action_buffer));
+    irc_privmsg(user.nick, room->target, duplicate(action_buffer));
 }
 
 static void command_part(char *parameter)
@@ -1103,7 +1212,7 @@ static void room_add_nicks(char const *channel, char *nicks)
         node = node->next;
 
     for (char *n = strtok(nicks, " "); n; n = strtok(NULL, " ")) {
-        if (!strcmp(nick, n))
+        if (!strcmp(user.nick, n))
             continue;
         node->next = new_nick_node(n);
         node = node->next;
@@ -1217,7 +1326,7 @@ void handle_outbound_message(char *message)
         }
     } else if (room) {
         irc_send("PRIVMSG %s :%s", room->target, message);
-        irc_privmsg(nick, room->target, message);
+        irc_privmsg(user.nick, room->target, message);
     } else {
         /* We're not in a room. Send this directly to the server. */
         irc_send("%s", message);
@@ -1238,18 +1347,18 @@ void handle_inbound_message(char *message)
         atomic_store(&should_pong, true);
         break;
     case IRC_PRIVMSG:
-        if (!strcmp(msg.paramv[0], nick))
+        if (!strcmp(msg.paramv[0], user.nick))
             irc_privmsg(msg.prefix.nick, msg.prefix.nick, msg.paramv[1]);
         else
             irc_privmsg(msg.prefix.nick, msg.paramv[0], msg.paramv[1]);
         break;
     case IRC_JOIN:
-        if (!strcmp(msg.prefix.nick, nick))
+        if (!strcmp(msg.prefix.nick, user.nick))
             join_room(msg.paramv[0]);
         handle_user_join(msg.prefix.nick, msg.prefix.user, msg.prefix.host, msg.paramv[0]);
         break;
     case IRC_PART:
-        if (strcmp(msg.prefix.nick, nick)) {
+        if (strcmp(msg.prefix.nick, user.nick)) {
             char *message = msg.paramc == 2 ? msg.paramv[1] : NULL;
             handle_user_part(msg.prefix.nick, msg.paramv[0], message);
         }
@@ -1384,23 +1493,26 @@ int main(int argc, char *argv[])
     host = "irc.freenode.net";
     port = "6667";
 
-    nick = getenv("IRC_NICK");
-    if (!nick)
-        fatal("Couldn't get IRC_NICK from the environment");
+    char *home = getenv("HOME");
+    if (!home)
+        fatal("Couldn't get HOME from the environment");
 
-    username = getenv("IRC_USERNAME");
-    if (!username)
-        fatal("Couldn't get IRC_USERNAME from the environment");
+    char config_name[512];
+    snprintf(config_name, sizeof config_name, "%s/.irc.conf", home);
 
-    auth_string = getenv("IRC_AUTH_STRING");
-    if (!auth_string)
-        fatal("Couldn't get IRC_AUTH_STRING from the environment");
+    FILE *config = fopen(config_name, "r");
+    if (!config)
+        fatal("Failed to open configuration file. Please generate the default "\
+              "configuration file at ~/.irc.conf by running the setup script.");
+
+    load_configuration(config);
+
 
     if (!irc_connect(host, port))
         fatal("Couldn't connect to %s:%s", host, port);
 
-    if (!irc_authenticate(nick, username, host, nick, auth_string))
-        fatal("Failed to authenticate as user %s", username);
+    if (!irc_authenticate(user.nick, user.username, host, user.real_name, user.auth_string))
+        fatal("Failed to authenticate as user %s", user.username);
 
     /* Start handling messages from the server */
     pthread_t inbound_thread;
