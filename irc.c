@@ -308,7 +308,7 @@ static size_t column_count(char const *s)
     return result.columns;
 }
 
-static size_t fit_in_columns(char const *s, size_t n)
+static size_t fit_in_columns(char const *s, size_t n, bool split_at_space)
 {
     static TickitStringPos result;
         TickitStringPos limit = { -1, -1, -1, (int) n };
@@ -317,12 +317,14 @@ static size_t fit_in_columns(char const *s, size_t n)
 
         size_t idx = result.bytes;
 
+        if (!split_at_space)
+            return idx;
+
         while (idx && s[idx] && !isspace(s[idx]))
             idx -= 1;
 
         while (idx > 0 && s[idx] && isspace(s[idx - 1]))
             idx -= 1;
-
 
         if (idx) {
             record("Returning idx: %zu\n", idx);
@@ -498,7 +500,12 @@ static int expose_messages(TickitWindow *w, TickitEventType e, void *_info, void
         struct tm *time_info = localtime(&msg.timestamp);
         strftime(timestamp_buffer, sizeof timestamp_buffer, "%H:%M:%S", time_info);
 
-        size_t span = column_count(msg.text) / (rect.cols - offset) + 1;
+        size_t span = 0;
+        char *text = msg.text;
+        while (*text) {
+            text += fit_in_columns(text, rect.cols - offset, true);
+            span += 1;
+        }
 
         char from_buffer[20] = {0};
         if (msg.type == MSG_NORMAL)
@@ -519,7 +526,7 @@ static int expose_messages(TickitWindow *w, TickitEventType e, void *_info, void
 
             record("LEFT TO WRITE (%zu): `%s`\n", strlen(msg.text), msg.text);
 
-            size_t n = fit_in_columns(msg.text, rect.cols - offset);
+            size_t n = fit_in_columns(msg.text, rect.cols - offset, true);
 
             /* The nickname portion of an ACTION message is
              * a special case, since it goes in the message
@@ -528,7 +535,7 @@ static int expose_messages(TickitWindow *w, TickitEventType e, void *_info, void
              */
             if (msg.type == MSG_ACTION && lines_used == 0) {
                 render_as_color(buffer, colors.action, "%s ", msg.from);
-                n = fit_in_columns(msg.text, rect.cols - offset - column_count(msg.from) - 1);
+                n = fit_in_columns(msg.text, rect.cols - offset - column_count(msg.from) - 1, true);
             }
 
             /* The message was split onto the next line here,
@@ -546,7 +553,7 @@ static int expose_messages(TickitWindow *w, TickitEventType e, void *_info, void
             bool occurrence =  our_nick
                             && (our_nick == msg.text || !isalnum(*(our_nick - 1)))
                             && !isalnum(*(our_nick + strlen(nick)));
-            if (occurrence && our_nick - msg.text + strlen(nick) <= n) {
+            if (occurrence) {
                 *our_nick = '\0';
                 render_as_color(buffer, color, "%s", msg.text);
                 render_as_color(buffer, colors.nick_mentioned, "%s", nick);
@@ -610,8 +617,11 @@ static int expose_input_line(TickitWindow *w, TickitEventType e, void *_info, vo
     );
 
     size_t offset = 0;
-    if (column_count(input_buffer) + column_count(nick) + 5 >= rect.cols)
-        offset = fit_in_columns(input_buffer, column_count(input_buffer) + column_count(nick) + 5 - rect.cols + 1);
+    char save = input_buffer[cursor_bytes];
+    input_buffer[cursor_bytes] = '\0';
+    if (column_count(input_buffer) + column_count(nick) + 6 >= rect.cols)
+        offset = fit_in_columns(input_buffer, column_count(input_buffer) + column_count(nick) + 6 - rect.cols + 1, false);
+    input_buffer[cursor_bytes] = save;
 
     tickit_renderbuffer_goto(buffer, 0, 0);
     tickit_renderbuffer_erase(buffer, rect.cols);
@@ -620,7 +630,7 @@ static int expose_input_line(TickitWindow *w, TickitEventType e, void *_info, vo
 
     tickit_renderbuffer_goto(buffer, 0, 0);
     tickit_renderbuffer_textf(buffer, " [%s]: ", nick);
-    tickit_renderbuffer_textn(buffer, input_buffer + offset, cursor_bytes);
+    tickit_renderbuffer_textn(buffer, input_buffer + offset, cursor_bytes - offset);
 
     tickit_renderbuffer_get_cursorpos(buffer, &line, &col);
     tickit_window_cursor_at(w, line, col);
