@@ -46,17 +46,18 @@ username = $username
 auth = $(printf "$username\0$username\0$password" | base64)
 
 [colors]
-background = 0
+background = 234
 normal = 230
+input = 230
 warning = 31
 notification = 241
-timestamp = 237
-nick = 62
-mynick = 107
+timestamp = 240
+nick = 107
+mynick = 180
 mention = 172
 action = 192
-activity = 165
-important = 14
+activity = 29
+important = 203
 
 [channels]
 ; channels listed here will be auto-joined on startup
