@@ -177,6 +177,9 @@ static struct {
     char *auth_string;
 } user;
 
+static size_t autojoin_count;
+static char *autojoin[10];
+
 static size_t cursor_bytes;
 static size_t input_idx;
 static size_t input_count;
@@ -318,7 +321,11 @@ error:
 
 static void load_channel(char const *s)
 {
-    
+    if (autojoin_count == 10)
+        fatal("There are too many autojoin channels in your configuration file.\n"\
+              "The maximum number of channels which can be autojoined is 10");
+
+    autojoin[autojoin_count++] = duplicate(s);
 }
 
 static void load_configuration(FILE *f)
@@ -1585,6 +1592,12 @@ int main(int argc, char *argv[])
     tickit_window_bind_event(status_window, TICKIT_EV_EXPOSE, expose_status, NULL);
 
     tickit_window_bind_event(message_window, TICKIT_EV_MOUSE, scroll_messages, NULL);
+
+    /* Autojoin specified channels on startup */
+    for (size_t i = 0; i < autojoin_count; ++i) {
+        irc_send("JOIN %s", autojoin[i]);
+        usleep(200000);
+    }
 
     for (;;) {
         tickit_term_input_wait_msec(t, 100);
