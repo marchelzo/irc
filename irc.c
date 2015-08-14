@@ -1236,6 +1236,21 @@ static void handle_user_part(char *parting_nick, char *channel, char *message)
         notify(channel, "%s has left %s", parting_nick, channel);
 }
 
+static void handle_user_quit(char *quitting_nick, char *channel, char *message)
+{
+    atomic_store(&should_render_status, true);
+
+    struct room *room = get_room(channel);
+    assert(room);
+
+    room_remove_user(room, quitting_nick);
+
+    if (message)
+        notify(channel, "%s has quit %s (%s)", quitting_nick, channel, message);
+    else
+        notify(channel, "%s has quit %s", quitting_nick, channel);
+}
+
 static void room_add_nicks(char const *channel, char *nicks)
 {
     atomic_store(&should_render_status, true);
@@ -1400,6 +1415,11 @@ void handle_inbound_message(char *message)
             handle_user_part(msg.prefix.nick, msg.paramv[0], message);
         }
         break;
+    case IRC_QUIT:
+        if (strcmp(msg.prefix.nick, user.nick)) {
+            char *message = msg.paramc == 2 ? msg.paramv[1] : NULL;
+            handle_user_quit(msg.prefix.nick, msg.paramv[0], message);
+        }
     case IRC_NAMES:
         room_add_nicks(msg.paramv[2], msg.paramv[3]);
         break;
@@ -1603,26 +1623,18 @@ int main(int argc, char *argv[])
         tickit_term_input_wait_msec(t, 100);
         tickit_term_refresh_size(t);
         
-        record("MAIN: LOCKING\n");
         pthread_mutex_lock(&lock);
-        record("MAIN: LOCKED\n");
 
         tickit_term_setctl_int(t, TICKIT_TERMCTL_CURSORVIS, 0);
-        record("CALLING TICK\n");
         tickit_window_tick(root_window);
-        record("CALLED TICK\n");
-        record("CALLING EXPOSE\n");
         tickit_window_expose(root_window, NULL);
-        record("CALLED EXPOSE\n");
         tickit_window_take_focus(input_window);
         tickit_term_setctl_int(t, TICKIT_TERMCTL_CURSORVIS, 1);
 
         if (atomic_exchange(&should_pong, false))
             irc_send("PONG");
 
-        record("MAIN: UNLOCKING\n");
         pthread_mutex_unlock(&lock);
-        record("MAIN: UNLOCKED\n");
     }
 
     return 0;
