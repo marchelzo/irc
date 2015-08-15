@@ -471,21 +471,24 @@ static void room_add_user(struct room *room, char *nick)
     }
 }
 
-static void room_remove_user(struct room *room, char *nick)
+static bool room_remove_user(struct room *room, char *nick)
 {
         struct nick_node *node = room->nicks.head;
+        assert(room);
 
         if (!node)
-            return;
+            return false;
 
         while (node->next && strcmp(node->next->nick, nick))
             node = node->next;
         
         if (!node->next)
-            return;
+            return false;
 
         room->nicks.count -= 1;
         node->next = node->next->next;
+
+        return true;
 }
 
 static void notify(char *target, char const *fmt, ...)
@@ -1236,19 +1239,18 @@ static void handle_user_part(char *parting_nick, char *channel, char *message)
         notify(channel, "%s has left %s", parting_nick, channel);
 }
 
-static void handle_user_quit(char *quitting_nick, char *channel, char *message)
+static void handle_user_quit(char *quitting_nick, char *message)
 {
     atomic_store(&should_render_status, true);
 
-    struct room *room = get_room(channel);
-    assert(room);
-
-    room_remove_user(room, quitting_nick);
-
-    if (message)
-        notify(channel, "%s has quit %s (%s)", quitting_nick, channel, message);
-    else
-        notify(channel, "%s has quit %s", quitting_nick, channel);
+    for (size_t i = 0; i < room_count; ++i) {
+        if (!room_remove_user(rooms + i, quitting_nick))
+            continue;
+        if (message)
+            notify(rooms[i].target, "%s has quit %s (%s)", quitting_nick, message);
+        else
+            notify(rooms[i].target, "%s has quit %s", quitting_nick);
+    }
 }
 
 static void room_add_nicks(char const *channel, char *nicks)
@@ -1417,9 +1419,10 @@ void handle_inbound_message(char *message)
         break;
     case IRC_QUIT:
         if (strcmp(msg.prefix.nick, user.nick)) {
-            char *message = msg.paramc == 2 ? msg.paramv[1] : NULL;
-            handle_user_quit(msg.prefix.nick, msg.paramv[0], message);
+            char *message = msg.paramc == 1 ? msg.paramv[0] : NULL;
+            handle_user_quit(msg.prefix.nick, message);
         }
+        break;
     case IRC_NAMES:
         room_add_nicks(msg.paramv[2], msg.paramv[3]);
         break;
