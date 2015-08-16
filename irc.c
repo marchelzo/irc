@@ -1014,10 +1014,9 @@ static char *irc_receive(void)
 
         message[length++] = c;
 
-        bool finished = true;
-        finished &= length > 2;
-        finished &= message[length - 2] == '\r';
-        finished &= message[length - 1] == '\n';
+        bool finished = length > 2 &&
+                        message[length - 2] == '\r' &&
+                        message[length - 1] == '\n';
 
         if (finished)
             goto end;
@@ -1247,9 +1246,9 @@ static void handle_user_quit(char *quitting_nick, char *message)
         if (!room_remove_user(rooms + i, quitting_nick))
             continue;
         if (message)
-            notify(rooms[i].target, "%s has quit %s (%s)", quitting_nick, message);
+            notify(rooms[i].target, "%s has quit (%s)", quitting_nick, message);
         else
-            notify(rooms[i].target, "%s has quit %s", quitting_nick);
+            notify(rooms[i].target, "%s has quit", quitting_nick);
     }
 }
 
@@ -1591,7 +1590,7 @@ int main(int argc, char *argv[])
 
     tickit_term_setctl_int(t, TICKIT_TERMCTL_CURSORVIS, 1);
     tickit_term_setctl_int(t, TICKIT_TERMCTL_ALTSCREEN, 1);
-    tickit_term_setctl_int(t, TICKIT_TERMCTL_MOUSE, TICKIT_TERM_MOUSEMODE_DRAG);
+    tickit_term_setctl_int(t, TICKIT_TERMCTL_MOUSE, TICKIT_TERM_MOUSEMODE_MOVE);
 
     tickit_term_bind_event(t, TICKIT_EV_KEY, handle_input, NULL);
     tickit_term_bind_event(t, TICKIT_EV_RESIZE, handle_resize, NULL);
