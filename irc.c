@@ -1322,6 +1322,8 @@ static void tab_completion(void)
     while (idx && *input_keys[idx] != ' ')
         idx -= 1;
 
+    bool add_colon = !idx;
+
     size_t start;
     if (*input_keys[idx] != ' ')
         start = idx;
@@ -1355,7 +1357,9 @@ static void tab_completion(void)
             fatal("Out of memory...");
 
         strcpy(suggestion, msg.from + length);
-        strcat(suggestion, ": ");
+
+        if (add_colon)
+            strcat(suggestion, ": ");
 
         break;
     }
