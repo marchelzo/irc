@@ -207,9 +207,20 @@ static atomic_bool should_render_messages = true;
 static atomic_bool should_render_status = true;
 static atomic_bool should_pong;
 
+static TickitTerm *t;
 static TickitPen *default_pen;
 
 static FILE *log_file;
+
+static void cleanup(void)
+{
+    shutdown(connection, SHUT_RDWR);
+    if (t) {
+        tickit_term_clear(t);
+        tickit_term_flush(t);
+        tickit_term_destroy(t);
+    }
+}
 
 static void record(char const *fmt, ...)
 {
@@ -230,6 +241,7 @@ noreturn static void fatal(char const *fmt, ...)
     vfprintf(stderr, fmt, ap);
     fputc('\n', stderr);
     va_end(ap);
+
     exit(EXIT_FAILURE);
 }
 
@@ -1404,10 +1416,13 @@ void handle_inbound_message(char *message)
         atomic_store(&should_pong, true);
         break;
     case IRC_PRIVMSG:
-        if (!strcmp(msg.paramv[0], user.nick))
+        if (!strcmp(msg.paramv[0], user.nick)) {
+            if (!get_room(msg.prefix.nick))
+                join_room(msg.prefix.nick);
             irc_privmsg(msg.prefix.nick, msg.prefix.nick, msg.paramv[1]);
-        else
+        } else {
             irc_privmsg(msg.prefix.nick, msg.paramv[0], msg.paramv[1]);
+        }
         break;
     case IRC_JOIN:
         if (!strcmp(msg.prefix.nick, user.nick))
@@ -1549,6 +1564,8 @@ static void run_command(char const *command, char *parameter)
 
 int main(int argc, char *argv[])
 {
+    atexit(cleanup);
+
     log_file = fopen("LOG", "w");
     if (!log_file)
         fatal("Failed to open log file");
@@ -1584,7 +1601,7 @@ int main(int argc, char *argv[])
 
     default_pen = tickit_pen_new_attrs(TICKIT_PEN_BG, colors.background, -1);
 
-    TickitTerm *t = tickit_term_open_stdio();
+    t = tickit_term_open_stdio();
     if (!t)
         fatal("Couldn't create TickitTerm: %s", strerror(errno));
 
