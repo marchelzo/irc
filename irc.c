@@ -186,6 +186,7 @@ static size_t input_count;
 static char *input_keys[1024];
 static char input_buffer[4096];
 
+static pthread_t listener_thread;
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 
 static int rows;
@@ -214,7 +215,10 @@ static FILE *log_file;
 
 static void cleanup(void)
 {
-    shutdown(connection, SHUT_RDWR);
+    if (pthread_cancel(listener_thread))
+        fputs("Failed to cancel thread.\n", stderr);
+    if (write(connection, "goodbye", 7) != -1)
+        shutdown(connection, SHUT_RDWR);
     if (t) {
         tickit_term_clear(t);
         tickit_term_flush(t);
@@ -1594,9 +1598,8 @@ int main(int argc, char *argv[])
         fatal("Failed to authenticate as user %s", user.username);
 
     /* Start handling messages from the server */
-    pthread_t inbound_thread;
     record("STARTING LISTENER THREAD\n");
-    if (pthread_create(&inbound_thread, NULL, inbound_listener, NULL) != 0)
+    if (pthread_create(&listener_thread, NULL, inbound_listener, NULL) != 0)
         fatal("Failed to spawn inbound listener thread");
 
     default_pen = tickit_pen_new_attrs(TICKIT_PEN_BG, colors.background, -1);
