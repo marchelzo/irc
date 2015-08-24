@@ -12,6 +12,7 @@
 #include <assert.h>
 
 #include <unistd.h>
+#include <fcntl.h>
 #include <netdb.h>
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -97,35 +98,35 @@ struct message {
 
 typedef void (*command_function)(char *);
 struct { char const *name; command_function function; } command_table[] = {
-    { "join", command_join },
-    { "raw",  command_raw },
-    { "msg",  command_msg },
-    { "me",  command_action },
-    { "part",  command_part },
-    { "quit",  command_quit }
+    { "join", command_join   },
+    { "raw",  command_raw    },
+    { "msg",  command_msg    },
+    { "me",   command_action },
+    { "part", command_part   },
+    { "quit", command_quit   }
 };
 
 static size_t const command_count = sizeof command_table / sizeof command_table[0];
 
 struct { char const *string; enum irc_reply_type type; } irc_reply_table[] = {
-    { "372",     IRC_MOTD },
-    { "ERROR",   IRC_ERROR },
-    { "NOTICE",  IRC_NOTICE },
-    { "PART",    IRC_PART },
-    { "PRIVMSG", IRC_PRIVMSG },
-    { "375",     IRC_MOTD_START },
-    { "376",     IRC_MOTD_END },
-    { "PING",    IRC_PING },
+    { "372",     IRC_MOTD             },
+    { "ERROR",   IRC_ERROR            },
+    { "NOTICE",  IRC_NOTICE           },
+    { "PART",    IRC_PART             },
+    { "PRIVMSG", IRC_PRIVMSG          },
+    { "375",     IRC_MOTD_START       },
+    { "376",     IRC_MOTD_END         },
+    { "PING",    IRC_PING             },
     { "461",     IRC_NEED_MORE_PARAMS },
-    { "421",     IRC_UNKNOWN_COMMAND },
-    { "353",     IRC_NAMES },
-    { "366",     IRC_NAMES_END },
-    { "001",     IRC_WELCOME },
-    { "MODE",    IRC_MODE },
-    { "QUIT",    IRC_QUIT },
-    { "JOIN",    IRC_JOIN },
-    { "332",     IRC_TOPIC },
-    { "333",     IRC_TOPIC_WHO_TIME }
+    { "421",     IRC_UNKNOWN_COMMAND  },
+    { "353",     IRC_NAMES            },
+    { "366",     IRC_NAMES_END        },
+    { "001",     IRC_WELCOME          },
+    { "MODE",    IRC_MODE             },
+    { "QUIT",    IRC_QUIT             },
+    { "JOIN",    IRC_JOIN             },
+    { "332",     IRC_TOPIC            },
+    { "333",     IRC_TOPIC_WHO_TIME   }
 };
 
 static size_t const irc_replies = sizeof irc_reply_table / sizeof irc_reply_table[0];
@@ -133,8 +134,8 @@ static size_t const irc_replies = sizeof irc_reply_table / sizeof irc_reply_tabl
 static struct nick_list const empty_nick_list = { 0, NULL };
 
 enum {
-    ACTIVITY_NONE = 0,
-    ACTIVITY_NORMAL = 1,
+    ACTIVITY_NONE      = 0,
+    ACTIVITY_NORMAL    = 1,
     ACTIVITY_IMPORTANT = 2
 };
 
@@ -176,6 +177,8 @@ static struct {
     char *real_name;
     char *auth_string;
 } user;
+
+static char *message_handler;
 
 static size_t autojoin_count;
 static char *autojoin[10];
@@ -249,6 +252,17 @@ noreturn static void fatal(char const *fmt, ...)
     exit(EXIT_FAILURE);
 }
 
+static char const *irc_str_type(struct irc_reply const *msg)
+{
+    for (size_t i = 0; i < irc_replies; ++i) {
+        if (msg->type == irc_reply_table[i].type) {
+            return irc_reply_table[i].string;
+        }
+    }
+
+    return NULL;
+}
+
 static char *duplicate(char const *s)
 {
     size_t length = strlen(s);
@@ -260,6 +274,117 @@ static char *duplicate(char const *s)
     strcpy(result, s);
 
     return result;
+}
+
+static void irc_write_json(struct irc_reply const *msg, int fd)
+{
+    write(fd, "{", 1);
+
+    write(fd, "\"type\":", 7);
+    char const *type = irc_str_type(msg);
+    if (type) {
+        write(fd, "\"", 1);
+        write(fd, type, strlen(type));
+        write(fd, "\"", 1);
+    } else {
+        write(fd, "null", 4);
+    }
+
+    write(fd, ",", 1);
+
+    write(fd, "\"nick\":", 7);
+    if (msg->prefix.nick) {
+        write(fd, "\"", 1);
+        write(fd, msg->prefix.nick, strlen(msg->prefix.nick));
+        write(fd, "\"", 1);
+    } else {
+        write(fd, "null", 4);
+    }
+
+    write(fd, ",", 1);
+
+    write(fd, "\"user\":", 7);
+    if (msg->prefix.user) {
+        write(fd, "\"", 1);
+        write(fd, msg->prefix.user, strlen(msg->prefix.user));
+        write(fd, "\"", 1);
+    } else {
+        write(fd, "null", 4);
+    }
+
+    write(fd, ",", 1);
+
+    write(fd, "\"host\":", 7);
+    if (msg->prefix.host) {
+        write(fd, "\"", 1);
+        write(fd, msg->prefix.host, strlen(msg->prefix.host));
+        write(fd, "\"", 1);
+    } else {
+        write(fd, "null", 4);
+    }
+
+    write(fd, ",", 1);
+
+    write(fd, "\"params\":[", 10);
+    for (size_t i = 0; i < msg->paramc; ++i) {
+        char const *param = msg->paramv[i];
+        write(fd, "\"", 1);
+        while (*param) {
+            if (*param == '\\')
+                write(fd, "\\\\", 2);
+            else if (*param == '"')
+                write(fd, "\\\"", 2);
+            else
+                write(fd, param, 1);
+
+            param += 1;
+        }
+        write(fd, "\"", 1);
+
+        if (i + 1 == msg->paramc)
+            write(fd, "]", 1);
+        else
+            write(fd, ",", 1);
+    }
+
+    write(fd, "}", 1);
+
+    write(fd, "\n", 1);
+}
+
+static void external_message_handler(struct irc_reply const *msg)
+{
+    int p[2];
+    pipe(p);
+
+    assert(message_handler);
+
+    if (!fork()) {
+        dup2(p[0], STDIN_FILENO);
+        close(STDOUT_FILENO);
+        open("/dev/null", O_WRONLY);
+        execvp(message_handler, &message_handler);
+    } else {
+        close(p[0]);
+        irc_write_json(msg, p[1]);
+    }
+}
+
+static void load_handler(char const *s)
+{
+    char type[32];
+    char handler[256];
+
+    if (sscanf(s, "%31s = %255s", type, handler) == 2) {
+        if (!strcmp(type, "handler")) {
+            message_handler = duplicate(handler);
+        }
+    }
+
+    return;
+
+    fatal("Invalid setting in the handler section of the "\
+          "configuration file: `%s`", s);
 }
 
 static void load_color(char const *s)
@@ -364,6 +489,8 @@ static void load_configuration(FILE *f)
                 load = load_color;
             else if (!strcmp(section, "channels"))
                 load = load_channel;
+            else if (!strcmp(section, "handler"))
+                load = load_handler;
             else
                 fatal("Invalid section in configuration file: `%s`", section);
         } else {
@@ -859,17 +986,13 @@ static void irc_message_record(struct irc_reply const *reply)
 {
     record("===========================\n");
 
-    bool implemented = false;
-    for (size_t i = 0; i < irc_replies; ++i) {
-        if (reply->type == irc_reply_table[i].type) {
-            implemented = true;
-            record("Reply type: %s\n", irc_reply_table[i].string);
-            break;
-        }
-    }
+    char const *type = irc_str_type(reply);
 
-    if (!implemented)
+    if (type)
+        record("Reply type: %s\n", type);
+    else
         record("Reply type: UNRECOGNIZED\n");
+        
 
     if (reply->has_prefix) {
         if (reply->prefix.type == IRC_PREFIX_SERVER) {
@@ -1413,7 +1536,12 @@ void handle_inbound_message(char *message)
 
     atomic_store(&should_render_messages, true);
 
+    /* Write the message to the log file */
     irc_message_record(&msg);
+
+    /* If the user has defined an external message handler, use it here */
+    if (message_handler)
+        external_message_handler(&msg);
 
     switch (msg.type) {
     case IRC_PING:
