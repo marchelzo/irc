@@ -820,6 +820,15 @@ static void join_room(char *target, bool go)
     atomic_store(&should_render_status, true);
     atomic_store(&should_render_messages, true);
 
+     /*
+     * We may need to save the room index so that we can correct
+     * the value of `room`, which may become invalidated if `rooms`
+     * is re-allocated.
+     */
+    size_t room_idx;
+    if (!go)
+        room_idx = rooms - room;
+
     if (room_count == room_alloc) {
         room_alloc = room_alloc ? room_alloc * 2 : 1;
         rooms = realloc(rooms, room_alloc * sizeof *rooms);
@@ -844,6 +853,8 @@ static void join_room(char *target, bool go)
 
     if (go)
         room = new_room;
+    else
+        room = &rooms[room_idx];
 }
 
 /**
@@ -882,8 +893,7 @@ static int expose_messages(TickitWindow *w, TickitEventType e, void *_info, void
     /* Clear the new activity flag on the current room, since it's
      * no longer new (we're looking at it right now).
      */
-    if (room)
-        atomic_store(&room->activity, ACTIVITY_NONE);
+    atomic_store(&room->activity, ACTIVITY_NONE);
 
     
     /* Go backwards rendering the as many messages as can fit on the screen */
@@ -1032,12 +1042,6 @@ static int expose_status(TickitWindow *w, TickitEventType e, void *_info, void *
     TickitRect rect = info->rect;
 
     clear_with_color(buffer, colors.normal);
-
-    /* If we're not in a room, there's nothing
-     * interesting to display.
-     */
-    if (!room)
-        return 1;
 
     tickit_renderbuffer_goto(buffer, 0, 0);
 
@@ -1370,7 +1374,7 @@ static void command_action(char *parameter)
 {
     static char action_buffer[2048];
 
-    if (!room)
+    if (!room->target)
         return;
 
     snprintf(action_buffer, sizeof action_buffer, "%cACTION %s%c", 0x01, parameter, 0x01);
@@ -1381,7 +1385,7 @@ static void command_action(char *parameter)
 
 static void command_part(char *parameter)
 {
-    if (!room)
+    if (!room->target)
         return;
 
     atomic_store(&should_render_status, true);
@@ -1415,7 +1419,7 @@ static void command_quit(char *parameter)
 
 static void command_here(char *parameter)
 {
-    if (!room)
+    if (!room->target)
         return;
 
     bool here = room_get_user(room, parameter);
@@ -1750,11 +1754,11 @@ static int handle_input(TickitTerm *t, TickitEventType e, void *_info, void *dat
             memmove(input_keys + input_idx - 1, input_keys + input_idx, (input_count - input_idx) * sizeof *input_keys);
             input_idx -= 1;
             input_count -= 1;
-        } else if (room && room != rooms && !strcmp(info->str, "M-Left")) {
+        } else if (room != rooms && !strcmp(info->str, "M-Left")) {
             atomic_store(&should_render_messages, true);
             atomic_store(&should_render_status, true);
             room -= 1;
-        } else if (room && room != rooms + room_count - 1 && !strcmp(info->str, "M-Right")) {
+        } else if (room != &rooms[room_count - 1] && !strcmp(info->str, "M-Right")) {
             atomic_store(&should_render_status, true);
             atomic_store(&should_render_messages, true);
             room += 1;
@@ -1810,17 +1814,12 @@ static int handle_resize(TickitTerm *t, TickitEventType e, void *_info, void *da
 static void *inbound_listener(void *unused)
 {
     char *message;
-    record("STARTING INBOUND LISTEN LOOP\n");
     for (;;) {
         message = irc_receive();
 
-        record("LISTENER: LOCKING\n");
         pthread_mutex_lock(&lock);
-        record("LISTENER: LOCKED\n");
         handle_inbound_message(message);
-        record("LISTENER: UNLOCKING\n");
         pthread_mutex_unlock(&lock);
-        record("LISTENER: UNLOCKED\n");
 
         usleep(10000);
     }
