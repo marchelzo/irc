@@ -46,23 +46,32 @@ username = $username
 auth = $(printf "$username\0$username\0$password" | base64)
 
 [colors]
-background = 234
-normal = 230
-input = 230
-warning = 31
-notification = 241
-timestamp = 240
-nick = 107
-mynick = 180
-mention = 172
-action = 192
-activity = 29
-important = 203
+normal       = 230  25
+input        = 230  33
+warning      = 203  25
+notification = 250  25
+timestamp    = 250  25
+nick         = 186  25
+mynick       = 180  25
+mention      = 169  25
+action       = 226  25
+activity     = 51   25
+important    = 203  25
 
 [channels]
 ; channels listed here will be auto-joined on startup
-;##c
-;#freenode
+; ##c
+; #freenode
+
+[misc]
+; Maximum amount of characters of a nick to render.
+; The max on freenode is 16, but it takes up a lot of space.
+; RFC 1459 had 9 as the max.
+nicklength = 9
+
+; Auto switch to private chat if somebody sends you
+; a private message.
+autoswitch = off
 EOF
 
 echo "Done! You can find the configuration file at ~/.irc.conf"
