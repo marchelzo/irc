@@ -1024,7 +1024,7 @@ static int expose_input_line(TickitWindow *w, TickitEventType e, void *_info, vo
     tickit_renderbuffer_textn(buffer, input_buffer + offset, cursor_bytes - offset);
 
     tickit_renderbuffer_get_cursorpos(buffer, &line, &col);
-    tickit_window_cursor_at(w, line, col);
+    tickit_window_set_cursor_position(w, line, col);
 
 
     return 1;
@@ -1804,9 +1804,13 @@ static int handle_resize(TickitTerm *t, TickitEventType e, void *_info, void *da
     rows = info->lines;
     columns = info->cols;
 
-    tickit_window_set_geometry(windows.messages, 0, 0, rows - 2, columns);
-    tickit_window_set_geometry(windows.input, rows - 2, 0, 1, columns);
-    tickit_window_set_geometry(windows.status, rows - 1, 0, 1, columns);
+    TickitRect msgrect = {0, 0, rows - 2, columns};
+    TickitRect inputrect = {rows - 2, 0, 1, columns};
+    TickitRect statusrect = {rows - 1, 0, 1, columns};
+
+    tickit_window_set_geometry(windows.messages, msgrect);
+    tickit_window_set_geometry(windows.input, inputrect);
+    tickit_window_set_geometry(windows.status, statusrect);
 
     return 1;
 }
@@ -1916,9 +1920,15 @@ int main(int argc, char *argv[])
     tickit_term_bind_event(t, TICKIT_EV_RESIZE, handle_resize, NULL);
 
     windows.root = tickit_window_new_root(t);
-    windows.messages = tickit_window_new_subwindow(windows.root, 0, 0, rows - 2, columns);
-    windows.input = tickit_window_new_subwindow(windows.root, rows - 2, 0, 1, columns);
-    windows.status = tickit_window_new_subwindow(windows.root, rows - 1, 0, 1, columns);
+
+    TickitRect msgrect = {0, 0, rows - 2, columns};
+    TickitRect inputrect = {rows - 2, 0, 1, columns};
+    TickitRect statusrect = {rows - 1, 0, 1, columns};
+
+
+    windows.messages = tickit_window_new(windows.root, msgrect, 0);
+    windows.input = tickit_window_new(windows.root, inputrect, 0);
+    windows.status = tickit_window_new(windows.root, statusrect, 0);
 
     assert(windows.root);
     assert(windows.messages);
@@ -1943,7 +1953,7 @@ int main(int argc, char *argv[])
         pthread_mutex_lock(&lock);
 
         tickit_term_setctl_int(t, TICKIT_TERMCTL_CURSORVIS, 0);
-        tickit_window_tick(windows.root);
+        tickit_window_flush(windows.root);
         tickit_window_expose(windows.root, NULL);
         tickit_window_take_focus(windows.input);
         tickit_term_setctl_int(t, TICKIT_TERMCTL_CURSORVIS, 1);
