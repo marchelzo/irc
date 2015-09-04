@@ -6,11 +6,15 @@ else
 	CC = gcc-5
 endif
 
-CFLAGS = -DDEBUG -std=c11 -flto -Wextra -Wall -Wno-unused -g
-LDFLAGS = -ltickit -lpthread
+CFLAGS = -DDEBUG -flto -std=c11 -Wextra -Wall -Wno-unused -O2
+
+LDFLAGS = -lncurses
+LDFLAGS += /usr/local/lib/libtermkey.a
+LDFLAGS += /usr/local/lib/libtickit.a
+
 
 all: irc
 
 .PHONY: irc
 irc: irc.c
-	$(CC) $(CFLAGS) -o irc irc.c $(LDFLAGS)
+	$(CC) -o irc irc.c $(CFLAGS) $(LDFLAGS)
