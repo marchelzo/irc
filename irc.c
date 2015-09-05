@@ -27,6 +27,7 @@ static void command_action(char *);
 static void command_part(char *);
 static void command_quit(char *);
 static void command_here(char *);
+static void command_topic(char *);
 
 static void irc_privmsg(char *, char *, char *);
 static void run_command(char const *, char *);
@@ -104,13 +105,14 @@ struct color {
 
 typedef void (*command_function)(char *);
 struct { char const *name; command_function function; } command_table[] = {
-    { "join", command_join   },
-    { "raw",  command_raw    },
-    { "msg",  command_msg    },
-    { "me",   command_action },
-    { "part", command_part   },
-    { "quit", command_quit   },
-    { "here", command_here   }
+    { "join",  command_join    },
+    { "raw",   command_raw     },
+    { "msg",   command_msg     },
+    { "me",    command_action  },
+    { "part",  command_part    },
+    { "quit",  command_quit    },
+    { "here",  command_here    },
+    { "topic", command_topic   }
 };
 
 static size_t const command_count = sizeof command_table / sizeof command_table[0];
@@ -1057,6 +1059,9 @@ static int expose_status(TickitWindow *w, TickitEventType e, void *_info, void *
         else
             color = colors.normal;
 
+        if (&rooms[i] == room)
+            color = colors.normal;
+
         if (rooms + i == room && room->type == ROOM_CHANNEL)
             render_as_color(buffer, color, " [%s:%zu] ", rooms[i].target, rooms[i].nicks.count);
         else if (rooms + i == room && room->type == ROOM_PRIVATE)
@@ -1430,6 +1435,18 @@ static void command_here(char *parameter)
         notify(room->target, "%s is not here", parameter);
 }
 
+static void command_topic(char *parameter)
+{
+    if (!room->target) {
+        warn("The server does not have a topic");
+        return;
+    } else if (!room->topic) {
+        warn("%s does not have a topic", room->target);
+    }
+
+    notify(room->target, "Topic for %s: %s", room->target, room->topic);
+}
+
 static bool irc_authenticate
 (
     char const *nick,
@@ -1582,7 +1599,8 @@ static void irc_privmsg(char *from, char *target, char *text)
         if (!r)
             fatal("FAILED GET_ROOM FOR: `%s`", target);
 
-        if (contains_nick(text))
+        if (r == room);
+        else if (contains_nick(text))
             atomic_store(&r->activity, ACTIVITY_IMPORTANT);
         else
             atomic_store(&r->activity, ACTIVITY_NORMAL);
