@@ -20,6 +20,8 @@
 
 #include <tickit.h>
 
+#include "utf8.h"
+
 static void command_join(char *);
 static void command_raw(char *);
 static void command_msg(char *);
@@ -291,7 +293,10 @@ static char *duplicate(char const *s)
     if (!result)
         fatal("Out of memory...");
 
-    strcpy(result, s);
+    char *r = result;
+    for (size_t i = 0; i <= length; ++i)
+        if (s[i] > 10 || s[i] <= 1)
+            *r++ = s[i];
 
     return result;
 }
@@ -588,6 +593,17 @@ static void load_configuration(FILE *f)
     }
 }
 
+static void debug_string(char const *s)
+{
+        record("\n\nString: `%s`\n\n", s);
+        record("Length: %zu\n", strlen(s));
+
+        for (char const *c = s; *c; ++c)
+                record("Byte %zu: %hhd\n", c - s, *c);
+
+        record("\n\n");
+}
+
 static int render_as_color(TickitRenderBuffer *rb, struct color color, char *fmt, ...)
 {
     static TickitPen *pen;
@@ -753,7 +769,7 @@ static struct nick_node *room_get_user(struct room *room, char *nick)
 
 static void notify(char *target, char const *fmt, ...)
 {
-    static char notification[1024];
+    char notification[1024];
 
     va_list ap;
     va_start(ap, fmt);
@@ -771,7 +787,7 @@ static void notify(char *target, char const *fmt, ...)
 
 static void warn(char const *fmt, ...)
 {
-    static char warning[4096];
+    char warning[4096];
 
     va_list ap;
     va_start(ap, fmt);
@@ -829,7 +845,7 @@ static void join_room(char *target, bool go)
      */
     size_t room_idx;
     if (!go)
-        room_idx = rooms - room;
+        room_idx = room - rooms;
 
     if (room_count == room_alloc) {
         room_alloc = room_alloc ? room_alloc * 2 : 1;
@@ -1261,7 +1277,8 @@ static char *irc_receive(void)
     size_t alloc = 0, length = 0;
     char c;
 
-    while (read(connection, &c, 1) == 1) {
+    ssize_t n;
+    while (n = read(connection, &c, 1), n == 1) {
         if (length == alloc) {
             alloc = alloc * 2 + 4;
             message = realloc(message, alloc);
@@ -1277,6 +1294,9 @@ static char *irc_receive(void)
         if (finished)
             goto end;
     }
+
+    if (n == -1)
+        fatal("Lost connection to the server");
 
     if (length == 0)
         return NULL;
@@ -1592,9 +1612,16 @@ static void irc_privmsg(char *from, char *target, char *text)
 
     message->target = target;
     message->from = from;
-    message->text = text;
     
-    if ((!room->target && target) || strcmp(room->target, target)) {
+    if (is_utf8(text))
+        message->text = text;
+    else {
+        message->text = duplicate("<invalid utf-8 text>");
+        record("\n\n|%s|\n\n", text);
+        debug_string(text);
+    }
+    
+    if (room->target && target && strcmp(room->target, target)) {
         struct room *r = get_room(target);
         if (!r)
             fatal("FAILED GET_ROOM FOR: `%s`", target);
@@ -1750,6 +1777,9 @@ void handle_inbound_message(char *message)
         else                 /* User mode */
             notify(NULL, "%s sets mode %s for %s", msg.prefix.nick, msg.paramv[1], msg.paramv[0]);
         break;
+    case IRC_NOTICE:
+        notify(NULL, "(%s) %s", msg.prefix.nick, msg.paramv[1]);
+        break;
     default:
         break;
     }
@@ -1775,11 +1805,15 @@ static int handle_input(TickitTerm *t, TickitEventType e, void *_info, void *dat
         } else if (room != rooms && !strcmp(info->str, "M-Left")) {
             atomic_store(&should_render_messages, true);
             atomic_store(&should_render_status, true);
+            pthread_mutex_lock(&lock);
             room -= 1;
+            pthread_mutex_unlock(&lock);
         } else if (room != &rooms[room_count - 1] && !strcmp(info->str, "M-Right")) {
             atomic_store(&should_render_status, true);
             atomic_store(&should_render_messages, true);
+            pthread_mutex_lock(&lock);
             room += 1;
+            pthread_mutex_unlock(&lock);
         } else if (room && !strcmp(info->str, "C-w")) {
             command_part("Leaving...");
         } else if (input_idx > 0 && !strcmp(info->str, "Left")) {
