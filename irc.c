@@ -16,6 +16,7 @@
 #include <netdb.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <signal.h>
 #include <pthread.h>
 
 #include <tickit.h>
@@ -177,7 +178,7 @@ static struct {
     {14,  0}
 };
 
-static int connection;
+static int connection = -1;
 
 static char *flag_network = "irc.freenode.net";
 static char *port;
@@ -193,7 +194,8 @@ static bool flag_no_sasl;
 static int nicklength = 16;
 static bool autoswitch = true;
 
-static char *message_handler;
+static int ext_handler_pid = -1;
+static int ext_handler_fd = -1;
 
 static size_t autojoin_count;
 static char *autojoin[10];
@@ -240,10 +242,14 @@ static FILE *log_file;
 
 static void cleanup(void)
 {
-    if (pthread_cancel(listener_thread))
-        fputs("Failed to cancel thread.\n", stderr);
-    if (write(connection, "goodbye", 7) != -1)
+    if (ext_handler_pid != -1)
+        kill(ext_handler_pid, SIGKILL);
+
+    pthread_cancel(listener_thread);
+
+    if (connection != -1 && write(connection, "goodbye", 7) != -1)
         shutdown(connection, SHUT_RDWR);
+
     if (t) {
         tickit_term_clear(t);
         tickit_term_flush(t);
@@ -393,36 +399,54 @@ static void irc_write_json(struct irc_reply const *msg, int fd)
     write(fd, "\n", 1);
 }
 
-static void external_message_handler(struct irc_reply const *msg)
-{
-    int p[2];
-    pipe(p);
-
-    assert(message_handler);
-
-    if (!fork()) {
-        dup2(p[0], STDIN_FILENO);
-        close(STDOUT_FILENO);
-        open("/dev/null", O_WRONLY);
-        execvp(message_handler, &message_handler);
-    } else {
-        close(p[0]);
-        irc_write_json(msg, p[1]);
-    }
-}
-
 static void load_handler(char const *s)
 {
     char type[32];
     char handler[256];
+    char *hp;
 
     if (sscanf(s, "%31s = %255s", type, handler) == 2) {
         if (!strcmp(type, "handler")) {
-            message_handler = duplicate(handler);
+            hp = duplicate(handler);
+            hp[strcspn(hp, "\n")] = 0;
+
+            errno = 0;
+            int p[2];
+            pipe(p);
+
+            if (errno)
+                fatal("Failed pipe: %s\n", strerror(errno));            
+
+
+            int pid;
+            if (!(pid = fork())) {
+                errno = 0;
+
+                dup2(p[0], STDIN_FILENO);
+
+                if (errno)
+                        fatal("Failed dup2: %s\n", strerror(errno));            
+
+                close(STDOUT_FILENO);
+                if (errno)
+                        fatal("Failed to close STDOUT_FILENO: %s\n", strerror(errno));            
+
+                open("/dev/null", O_WRONLY);
+                if (errno)
+                        fatal("Failed to open /dev/null: %s\n", strerror(errno));            
+
+                execlp(hp, hp, NULL);
+
+                if (errno)
+                        fatal("Failed execvp: %s\n", strerror(errno));            
+            } else {
+                close(p[0]);
+                ext_handler_fd = p[1];
+                ext_handler_pid = pid;
+                return;
+            }
         }
     }
-
-    return;
 
     fatal("Invalid setting in the handler section of the "\
           "configuration file: `%s`", s);
@@ -1732,8 +1756,8 @@ void handle_inbound_message(char *message)
     irc_message_record(&msg);
 
     /* If the user has defined an external message handler, use it here */
-    if (message_handler)
-        external_message_handler(&msg);
+    if (ext_handler_fd != -1)
+        irc_write_json(&msg, ext_handler_fd);
 
     switch (msg.type) {
     case IRC_PING:
