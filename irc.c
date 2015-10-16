@@ -190,6 +190,7 @@ static struct {
 } user;
 
 static bool flag_no_sasl;
+static bool flag_no_handler;
 
 static int nicklength = 16;
 static bool autoswitch = true;
@@ -253,8 +254,14 @@ static void cleanup(void)
     if (t) {
         tickit_term_clear(t);
         tickit_term_flush(t);
+        tickit_term_setctl_int(t, TICKIT_TERMCTL_MOUSE, TICKIT_TERM_MOUSEMODE_OFF);
         tickit_term_destroy(t);
     }
+}
+
+static void sigint(int _)
+{
+        exit(EXIT_SUCCESS);
 }
 
 static void record(char const *fmt, ...)
@@ -404,6 +411,9 @@ static void load_handler(char const *s)
     char type[32];
     char handler[256];
     char *hp;
+
+    if (flag_no_handler)
+        return;
 
     if (sscanf(s, "%31s = %255s", type, handler) == 2) {
         if (!strcmp(type, "handler")) {
@@ -1395,7 +1405,7 @@ static void command_msg(char *parameter)
     static char target_buffer[256];
     static int idx;
 
-    if (sscanf(parameter, "%255s%n", target_buffer, &idx) < 1) {
+    if (sscanf(parameter, "%255s%n", target_buffer, &idx) != 1) {
         warn("Invalid argument to /msg: %s", parameter);
         return;
     }
@@ -1734,7 +1744,7 @@ void handle_outbound_message(char *message)
             *c = '\0';
             run_command(message, c + 1);
         } else {
-            run_command(message, NULL);
+            run_command(message, "");
         }
     } else if (room->target) {
         irc_send("PRIVMSG %s :%s", room->target, message);
@@ -1849,7 +1859,24 @@ static int handle_input(TickitTerm *t, TickitEventType e, void *_info, void *dat
         } else if (!strcmp(info->str, "C-e")) {
             input_idx = input_count;
         } else if (!strcmp(info->str, "C-k")) {
-            input_count = input_idx;
+            /*
+             * Ctrl + K is dual-purposed. If there is no text
+             * after the cursor, it scrolls up.
+             *
+             * Otherwise it's like readline Ctrl + K: it deletes
+             * any text adter the cursor.
+             */
+            if (input_idx == input_count) {
+                scroll_idx += 5;
+                atomic_store(&should_render_messages, true);
+            } else
+                input_count = input_idx;
+        } else if (!strcmp(info->str, "C-j")) {
+                atomic_store(&should_render_messages, true);
+                if (scroll_idx < 5)
+                    scroll_idx = 0;
+                else
+                    scroll_idx -= 5;
         } else if (!strcmp(info->str, "Tab")) {
             tab_completion();
         }
@@ -1938,6 +1965,8 @@ int main(int argc, char *argv[])
         for (argv += 1; *argv; ++argv) {
             if (!strcmp(*argv, "--no-sasl"))
                 flag_no_sasl = true;
+            else if (!strcmp(*argv, "--no-handler"))
+                flag_no_handler = true;
             else if (!strncmp(*argv, "--network=", 10))
                 flag_network = *argv + 10;
         }
@@ -2021,6 +2050,9 @@ int main(int argc, char *argv[])
         irc_send("JOIN %s", autojoin[i]);
         usleep(200000);
     }
+
+    /* C-c is handled manually to do cleanup */
+    signal(SIGINT, sigint);
 
     for (;;) {
         tickit_term_input_wait_msec(t, 100);
