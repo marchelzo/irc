@@ -31,6 +31,7 @@ static void command_part(char *);
 static void command_quit(char *);
 static void command_here(char *);
 static void command_topic(char *);
+static void command_nicks(char *);
 
 static void irc_privmsg(char *, char *, char *);
 static void run_command(char const *, char *);
@@ -115,7 +116,8 @@ struct { char const *name; command_function function; } command_table[] = {
     { "part",  command_part    },
     { "quit",  command_quit    },
     { "here",  command_here    },
-    { "topic", command_topic   }
+    { "topic", command_topic   },
+    { "nicks", command_nicks   }
 };
 
 static size_t const command_count = sizeof command_table / sizeof command_table[0];
@@ -233,6 +235,12 @@ static TickitTerm *t;
 static TickitPen *default_pen;
 
 static struct {
+    char *lines[256];
+    size_t count;
+    size_t idx;
+} history;
+
+static struct {
     TickitWindow *root;
     TickitWindow *messages;
     TickitWindow *input;
@@ -312,6 +320,33 @@ static char *duplicate(char const *s)
             *r++ = s[i];
 
     return result;
+}
+
+static char *history_next(void)
+{
+    if (history.idx == history.count - 1) {
+        return NULL;
+    }
+
+    return history.lines[++history.idx];
+}
+
+static char *history_prev(void)
+{
+    if (history.idx == 0) {
+        return NULL;
+    }
+
+    return history.lines[--history.idx];
+}
+
+static void history_add(char const *line)
+{
+    if (history.count == sizeof history.lines / sizeof history.lines[0]) {
+    }
+
+    history.lines[history.count++] = duplicate(line);
+    history.idx = history.count;
 }
 
 static bool contains_nick(char const *s)
@@ -1383,6 +1418,18 @@ static void input_insert(char *s)
     input_count += 1;
 }
 
+static void input_load(char const *line)
+{
+    input_idx = 0;
+    input_count = 0;
+
+    for (char const *c = line; *c; ++c) {
+        input_insert(duplicate((char[]){*c, 0}));
+    }
+
+    atomic_store(&should_render_input_line, true);
+}
+
 static void command_join(char *parameter)
 {
     static char channel[128];
@@ -1487,6 +1534,24 @@ static void command_here(char *parameter)
         notify(room->target, "%s is here", parameter);
     else
         notify(room->target, "%s is not here", parameter);
+}
+
+static void command_nicks(char *parameter)
+{
+    if (!room->target)
+        return;
+
+    struct nick_node *node = room->nicks.head;
+    assert(room);
+
+    notify(room->target, "Nicks matching `%s`", parameter);
+    notify(room->target, "---------------------------");
+    while (node) {
+        if (strstr(node->nick, parameter))
+            notify(room->target, "    %s", node->nick);
+        node = node->next;
+    }
+    notify(room->target, "---------------------------");
 }
 
 static void command_topic(char *parameter)
@@ -1737,6 +1802,8 @@ static void tab_completion(void)
 
 void handle_outbound_message(char *message)
 {
+    history_add(message);
+
     if (*message == '/') {
         message += 1;
         char *c = strchr(message, ' ');
@@ -1827,9 +1894,11 @@ static int handle_input(TickitTerm *t, TickitEventType e, void *_info, void *dat
 
     if (info->type == TICKIT_KEYEV_KEY) {
         if (!strcmp(info->str, "Enter")) {
-            handle_outbound_message(duplicate(input_buffer));
-            input_idx = 0;
-            input_count = 0;
+            if (*input_buffer) {
+                handle_outbound_message(duplicate(input_buffer));
+                input_idx = 0;
+                input_count = 0;
+            }
         } else if (!strcmp(info->str, "C-c")) {
             exit(EXIT_SUCCESS);
         } else if (input_idx > 0 && !strcmp(info->str, "Backspace")) {
@@ -1850,6 +1919,20 @@ static int handle_input(TickitTerm *t, TickitEventType e, void *_info, void *dat
             pthread_mutex_unlock(&lock);
         } else if (room && !strcmp(info->str, "C-w")) {
             command_part("Leaving...");
+        } else if (!strcmp(info->str, "Up")) {
+            char *line = history_prev();
+            if (line) {
+                record("Line: `%s`\n", line);
+                input_load(line);
+            }
+        } else if (!strcmp(info->str, "Down")) {
+            char *line = history_next();
+            if (line) {
+                input_load(line);
+            } else {
+                input_idx = 0;
+                input_count = 0;
+            }
         } else if (input_idx > 0 && !strcmp(info->str, "Left")) {
             input_idx -= 1;
         } else if (input_idx < input_count && !strcmp(info->str, "Right")) {
