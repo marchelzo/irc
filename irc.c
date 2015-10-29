@@ -193,6 +193,7 @@ static struct {
 
 static bool flag_no_sasl;
 static bool flag_no_handler;
+static bool flag_no_autojoin;
 
 static int nicklength = 16;
 static bool autoswitch = true;
@@ -1712,13 +1713,9 @@ static void irc_privmsg(char *from, char *target, char *text)
     message->target = target;
     message->from = from;
     
-    if (is_utf8(text))
-        message->text = text;
-    else {
-        message->text = duplicate("<invalid utf-8 text>");
-        record("\n\n|%s|\n\n", text);
-        debug_string(text);
-    }
+    message->text = into_utf8(text);
+    if (!message->text)
+        fatal("Out of memory...");
     
     if (room->target && target && strcmp(room->target, target)) {
         struct room *r = get_room(target);
@@ -2050,6 +2047,8 @@ int main(int argc, char *argv[])
                 flag_no_sasl = true;
             else if (!strcmp(*argv, "--no-handler"))
                 flag_no_handler = true;
+            else if (!strcmp(*argv, "--no-autojoin"))
+                flag_no_autojoin = true;
             else if (!strncmp(*argv, "--network=", 10))
                 flag_network = *argv + 10;
         }
@@ -2129,9 +2128,11 @@ int main(int argc, char *argv[])
     tickit_window_bind_event(windows.messages, TICKIT_EV_MOUSE, scroll_messages, NULL);
 
     /* Autojoin specified channels on startup */
-    for (size_t i = 0; i < autojoin_count; ++i) {
-        irc_send("JOIN %s", autojoin[i]);
-        usleep(200000);
+    if (!flag_no_autojoin) {
+        for (size_t i = 0; i < autojoin_count; ++i) {
+            irc_send("JOIN %s", autojoin[i]);
+            usleep(200000);
+        }
     }
 
     /* C-c is handled manually to do cleanup */
