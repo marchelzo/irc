@@ -273,6 +273,11 @@ static void sigint(int _)
         exit(EXIT_SUCCESS);
 }
 
+static inline int max(int a, int b)
+{
+        return (a > b) ? a : b;
+}
+
 static void record(char const *fmt, ...)
 {
 #ifdef DEBUG
@@ -1120,6 +1125,9 @@ static int expose_input_line(TickitWindow *w, TickitEventType e, void *_info, vo
 
 static int expose_status(TickitWindow *w, TickitEventType e, void *_info, void *data)
 {
+    /*
+     * We want to call this at least once (at startup)
+     */
     static bool called;
 
     if (!atomic_exchange(&should_render_status, false) && called++)
@@ -1717,16 +1725,19 @@ static void irc_privmsg(char *from, char *target, char *text)
     if (!message->text)
         fatal("Out of memory...");
     
-    if (room->target && target && strcmp(room->target, target)) {
+    if (!room->target || (target && strcmp(room->target, target))) {
         struct room *r = get_room(target);
         if (!r)
             fatal("FAILED GET_ROOM FOR: `%s`", target);
 
+        int activity_level = atomic_load(&r->activity);
         if (r == room);
         else if (contains_nick(text))
-            atomic_store(&r->activity, ACTIVITY_IMPORTANT);
+            activity_level = max(activity_level, ACTIVITY_IMPORTANT);
         else
-            atomic_store(&r->activity, ACTIVITY_NORMAL);
+            activity_level = max(activity_level, ACTIVITY_NORMAL);
+
+        atomic_store(&r->activity, activity_level);
 
         atomic_store(&should_render_status, true);
     }
